@@ -49,4 +49,8 @@ template<typename T>
 unsigned char *
 sz_compress_cp_preserve_2d_bilinear_online_log(const T * U, const T * V, size_t r1, size_t r2, size_t& compressed_size, bool transpose=false, double max_pwr_eb=0.1);
 
+template<typename T>
+T
+derive_cp_abs_eb_sos_online(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2);
+
 #endif

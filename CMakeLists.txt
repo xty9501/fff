@@ -22,7 +22,7 @@ add_executable(main2d test/main2d.cpp ${SRC_FILES})
 target_include_directories(main2d PRIVATE "./include" PRIVATE "/project/xli281_uksr/mxia/git/ftk/install/include/ftk" PRIVATE "./src")
 target_link_libraries(main2d FTK::libftk zstd::libzstd_shared Eigen3::Eigen)
 
-add_executable(test test/test.cpp)
+add_executable(test test/test.cpp ${SRC_FILES})
 target_include_directories(test PRIVATE "./include" PRIVATE "/project/xli281_uksr/mxia/git/ftk/install/include/ftk" PRIVATE "./src")
 target_link_libraries(test FTK::libftk zstd::libzstd_shared Eigen3::Eigen)
 

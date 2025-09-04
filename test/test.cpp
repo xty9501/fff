@@ -22,232 +22,15 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include "sz_compress_cp_preserve_2d.hpp"
+#include "sz_cp_preserve_utils.hpp"
+#include "sz_def.hpp"
+#include "sz_compression_utils.hpp"
+#include "sz_lossless.hpp"
+#include "utils.hpp"
+#include "sz_decompression_utils.hpp"
 
 
-namespace m3d {
-
-struct Size { int H, W, T; };
-inline int vid(int i,int j,int t,const Size& sz){ return t*(sz.H*sz.W)+i*sz.W+j; }
-
-enum class TriInCell : unsigned char { Upper=0, Lower=1 };
-
-inline std::array<int,3> tri_vertices_2d(int i,int j,TriInCell w,int t,const Size& sz){
-    int v00=vid(i,  j,  t,sz), v01=vid(i,  j+1,t,sz), v10=vid(i+1,j,  t,sz), v11=vid(i+1,j+1,t,sz);
-    return (w==TriInCell::Upper) ? std::array<int,3>{v00,v01,v11}
-                                 : std::array<int,3>{v00,v10,v11};
-}
-
-struct Tet { int v[4]; }; // 仅用于回调传参（不做全量存储）
-
-// 固定 3-tet 剖分
-inline std::array<Tet,3> prism_split_3tets(const std::array<int,3>& v_t,
-                                           const std::array<int,3>& v_tp1){
-    return {{
-        Tet{ v_t[0],   v_t[1],   v_t[2],   v_tp1[2] },
-        Tet{ v_t[0],   v_t[1],   v_tp1[1], v_tp1[2] },
-        Tet{ v_t[0],   v_tp1[0], v_tp1[1], v_tp1[2] }
-    }};
-}
-
-// 以 FaceKey(升序) 作为无向面键
-struct FaceKey{
-    std::array<int,3> v;
-    FaceKey()=default;
-    FaceKey(int a,int b,int c){ v={a,b,c}; std::sort(v.begin(),v.end()); }
-    bool operator==(const FaceKey& o) const { return v==o.v; }
-};
-struct FaceKeyHash{
-    size_t operator()(const FaceKey& k) const noexcept{
-        // 简洁的 64bit 组合哈希
-        size_t h=1469598103934665603ull;
-        for(int x: k.v){ h ^= (size_t)x + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2); }
-        return h;
-    }
-};
-
-// 面邻接的固定 2 槽
-struct FaceAdj2{
-    int a=-1, b=-1;
-    inline void add(int t){ if(a<0) a=t; else if(b<0) b=t; /*>2忽略或报警*/ }
-    inline int size() const { return (a<0?0:(b<0?1:2)); }
-};
-
-// —— 计算片 [t, t+1] 的 face→tets（仅此片的 tet）——
-using FaceMap = std::unordered_map<FaceKey, FaceAdj2, FaceKeyHash>;
-
-inline void build_face_map_one_slab(const Size& sz, int t, FaceMap& fmap){
-    const int dv = sz.H*sz.W;
-    // 经验预估：每片约 3*triangles_per_layer 个 tet，唯一面 ~ 2×tets
-    const size_t triangles_per_layer = size_t(2)*(sz.H-1)*(sz.W-1);
-    const size_t tets_in_slab = 3*triangles_per_layer;
-    fmap.clear();
-    fmap.reserve(size_t(2.2*tets_in_slab)); // 留余量
-    fmap.max_load_factor(0.7f);
-
-    // 遍历本片所有棱柱并拆成3个tet；把每个tet的4个面塞进 fmap
-    // 可并行（注意 unordered_map 需分线程局部再归并；此处提供单线程安全版本）
-    for(int i=0;i<sz.H-1;++i){
-        for(int j=0;j<sz.W-1;++j){
-            for(auto w : {TriInCell::Upper, TriInCell::Lower}){
-                auto v_t   = tri_vertices_2d(i,j,w,t,sz);
-                std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-                auto T = prism_split_3tets(v_t, v_tp1);
-                for(const auto& K : T){
-                    // 四个三角面（未排序→FaceKey内部排序）
-                    FaceKey f0(K.v[0],K.v[1],K.v[2]);
-                    FaceKey f1(K.v[0],K.v[1],K.v[3]);
-                    FaceKey f2(K.v[0],K.v[2],K.v[3]);
-                    FaceKey f3(K.v[1],K.v[2],K.v[3]);
-                    int tid = -1; // 本示例不分配全局tid；只做面->片内tets编号可选
-                    fmap[f0].add(tid); fmap[f1].add(tid);
-                    fmap[f2].add(tid); fmap[f3].add(tid);
-                }
-            }
-        }
-    }
-}
-
-// —— 仅遍历（流式）：不给你存任何大容器 ——
-// 回调签名：visit(i,j,t,w,k, Tet{...}, faces[4](FaceKey))
-template<class Visitor>
-inline void traverse_all_tets_stream(const Size& sz, Visitor&& visit){
-    const int dv = sz.H*sz.W;
-    for(int t=0; t<sz.T-1; ++t){
-      #pragma omp parallel for collapse(2) if(sz.H*sz.W>20000)
-        for(int i=0;i<sz.H-1;++i){
-            for(int j=0;j<sz.W-1;++j){
-                for(auto w : {TriInCell::Upper, TriInCell::Lower}){
-                    auto v_t   = tri_vertices_2d(i,j,w,t,sz);
-                    std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-                    auto T = prism_split_3tets(v_t, v_tp1);
-                    for(int k=0;k<3;++k){
-                        const Tet& K = T[k];
-                        std::array<FaceKey,4> faces = {
-                            FaceKey(K.v[0],K.v[1],K.v[2]),
-                            FaceKey(K.v[0],K.v[1],K.v[3]),
-                            FaceKey(K.v[0],K.v[2],K.v[3]),
-                            FaceKey(K.v[1],K.v[2],K.v[3])
-                        };
-                        visit(i,j,t,w,k,K,faces);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// —— 给定三点(面)→ 找相邻 tet（通过“片”决定查询范围）——
-// 注意：此函数示意“如何选片”；真正查找需你在该片调用 build_face_map_one_slab 后用 fmap.count(key) 判断。
-inline void which_slabs_for_face(const Size& sz, int a,int b,int c,
-                                 std::vector<int>& slabs) {
-    slabs.clear();
-    auto layer = [&](int v){ return v / (sz.H*sz.W); };
-    int ta=layer(a), tb=layer(b), tc=layer(c);
-    int mn = std::min({ta,tb,tc});
-    int mx = std::max({ta,tb,tc});
-    if (mn==mx){
-        // 同一时层：可能是 [t-1,t] 的顶面 或 [t,t+1] 的底面
-        int t = mn;
-        if (t>0)      slabs.push_back(t-1); // 查下片的顶面
-        if (t<sz.T-1) slabs.push_back(t);   // 查上片的底面
-    } else if (mx==mn+1){
-        // 跨两层：一定属于片 [mn, mn+1]
-        slabs.push_back(mn);
-    } else {
-        // 跳层（无效或异常）
-    }
-}
-
-
-template<class FaceVisitor>
-inline void traverse_unique_faces_across_slabs(const Size& sz, FaceVisitor&& face_visit) {
-    const int dv = sz.H * sz.W;
-    auto layer = [&](int v){ return v / (sz.H * sz.W); };
-
-    // 对一个三棱柱的 3 个 tet 做局部去重，并按跨片规则筛面
-    auto emit_unique_faces_of_prism = [&](int i,int j,int t,TriInCell w,
-                                          const std::array<Tet,3>& T){
-        // 局部 seen：存已发射过的“升序三元组”（最多 10 个）
-        int seen_n = 0;
-        int seen[12][3];
-
-        auto try_emit = [&](int x,int y,int z){
-            // 片内去重：按升序做无向键
-            int a=x, b=y, c=z;
-            if (a>b) std::swap(a,b);
-            if (b>c) std::swap(b,c);
-            if (a>b) std::swap(a,b);
-            for (int q=0; q<seen_n; ++q)
-                if (seen[q][0]==a && seen[q][1]==b && seen[q][2]==c) return; // 已处理
-
-            // 跨片去重：同层面只在“所属片”发射
-            int la = layer(x), lb = layer(y), lc = layer(z);
-            bool same_layer = (la==lb && lb==lc);
-            if (same_layer) {
-                // 同层面只在它的“底面片”发射；最后一片再补顶面
-                if      (la == t)        { /* 发射底面 */ }
-                else if (la == t+1)      { if (t != sz.T-2) return; /* 仅最后一片发射顶面 */ }
-                else                      return; // 异常层（不应出现）
-            } else {
-                // 侧面（跨 t 与 t+1），每片只出现一次，直接发射
-            }
-
-            // 记录为已发射，并回调
-            seen[seen_n][0]=a; seen[seen_n][1]=b; seen[seen_n][2]=c; ++seen_n;
-            face_visit(i,j,t,w, x,y,z);
-        };
-
-        for (const auto& K : T) {
-            try_emit(K.v[0], K.v[1], K.v[2]);
-            try_emit(K.v[0], K.v[1], K.v[3]);
-            try_emit(K.v[0], K.v[2], K.v[3]);
-            try_emit(K.v[1], K.v[2], K.v[3]);
-        }
-    };
-
-    for (int t=0; t<sz.T-1; ++t){
-      #pragma omp parallel for collapse(2) if(sz.H*sz.W>20000)
-        for (int i=0; i<sz.H-1; ++i){
-            for (int j=0; j<sz.W-1; ++j){
-                for (auto w : {TriInCell::Upper, TriInCell::Lower}){
-                    auto v_t   = tri_vertices_2d(i,j,w,t,sz);
-                    std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-                    auto T = prism_split_3tets(v_t, v_tp1);
-                    emit_unique_faces_of_prism(i,j,t,w, T);
-                }
-            }
-        }
-    }
-}
-
-inline void print_omp_runtime_info(const char* tag = "OMP") {
-#ifdef _OPENMP
-  // _OPENMP 是形如 yyyymm 的整数，例如 202011 表示 OpenMP 5.0 (Nov 2020)
-  std::cerr << "[" << tag << "] compiled with OpenMP: _OPENMP=" << _OPENMP << "\n";
-  std::cerr << "[" << tag << "] omp_get_num_procs()   = " << omp_get_num_procs()   << " (可用逻辑处理器)\n";
-  std::cerr << "[" << tag << "] omp_get_max_threads() = " << omp_get_max_threads() << " (默认最大并行线程)\n";
-  if (const char* s = std::getenv("OMP_NUM_THREADS"))
-    std::cerr << "[" << tag << "] OMP_NUM_THREADS      = " << s << "\n";
-  if (const char* s = std::getenv("OMP_PROC_BIND"))
-    std::cerr << "[" << tag << "] OMP_PROC_BIND        = " << s << "\n";
-  if (const char* s = std::getenv("OMP_PLACES"))
-    std::cerr << "[" << tag << "] OMP_PLACES           = " << s << "\n";
-
-  // 启一个并行区，测实际能拿到多少线程
-  #pragma omp parallel
-  {
-    #pragma omp single nowait
-    {
-      std::cerr << "[" << tag << "] parallel region threads = " << omp_get_num_threads()
-                << " (inside #pragma omp parallel)\n";
-    }
-  }
-#else
-  std::cerr << "[" << tag << "] OpenMP DISABLED (未使用 -fopenmp 编译)\n";
-#endif
-}
-
-} // namespace m3d
 
 
 // main.cpp
@@ -259,8 +42,11 @@ inline void print_omp_runtime_info(const char* tag = "OMP") {
 #include <fstream>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <limits>
+#include <iomanip>
+#include <algorithm>
 
-using namespace m3d;
 
 template<typename T, typename T_fp>
 static int64_t 
@@ -297,651 +83,633 @@ convert_to_fixed_point(const T * U, const T * V, size_t num_elements, T_fp * U_f
 	return vector_field_scaling_factor;
 }
 
-
-// 小工具：给定一个 tet，返回其四个面（FaceKey）
-static inline std::array<FaceKey,4> faces_of_tet_local(const Tet& K) {
-    return {
-        FaceKey(K.v[0], K.v[1], K.v[2]),
-        FaceKey(K.v[0], K.v[1], K.v[3]),
-        FaceKey(K.v[0], K.v[2], K.v[3]),
-        FaceKey(K.v[1], K.v[2], K.v[3])
-    };
+template<typename T, typename T_fp>
+static void 
+convert_to_floating_point(const T_fp * U_fp, const T_fp * V_fp, size_t num_elements, T * U, T * V, int64_t vector_field_scaling_factor){
+	for(int i=0; i<num_elements; i++){
+		U[i] = U_fp[i] * (T)1.0 / vector_field_scaling_factor;
+		V[i] = V_fp[i] * (T)1.0 / vector_field_scaling_factor;
+	}
 }
 
-// 功能2：给定三点(面)，查找相邻四面体（最多2个）。
-// 做法：根据三点所在时间层定位需检查的 slab（最多2个），仅扫描这些 slab。
-static std::vector<Tet> find_adjacent_tets_by_face(const Size& sz, int a, int b, int c) {
-    FaceKey target(a,b,c);
-    std::vector<int> slabs;
-    which_slabs_for_face(sz, a,b,c, slabs);
+// ================== 网格/索引基础 ==================
+struct Size3 { int H, W, T; }; // H=450, W=150, T=2001
+inline int vid(int t,int i,int j,const Size3& sz){
+    return t*(sz.H*sz.W) + i*sz.W + j; // 时间最慢
+}
+enum class TriInCell : unsigned char { Upper=0, Lower=1 };
 
-    std::vector<Tet> owners; owners.reserve(2);
-    const int dv = sz.H * sz.W;
+// cell(i,j) 内，两种2D三角（底/顶层都用相同拓扑）
+inline std::array<int,3> tri_vertices_2d(int i,int j,TriInCell which,int t,const Size3& sz){
+    const int v00=vid(t,i,  j,  sz), v01=vid(t,i,  j+1,sz),
+              v10=vid(t,i+1,j,  sz), v11=vid(t,i+1,j+1,sz);
+    return (which==TriInCell::Upper) ? std::array<int,3>{v00,v01,v11}
+                                     : std::array<int,3>{v00,v10,v11};
+}
 
-    for (int t : slabs) {
-        for (int i = 0; i < sz.H-1; ++i) {
-            for (int j = 0; j < sz.W-1; ++j) {
-                for (auto w : {TriInCell::Upper, TriInCell::Lower}) {
-                    auto v_t   = tri_vertices_2d(i,j,w,t,sz);
-                    std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-                    auto T = prism_split_3tets(v_t, v_tp1);
-                    for (const auto& K : T) {
-                        auto F = faces_of_tet_local(K);
-                        for (const auto& fk : F) {
-                            if (fk == target) {
-                                owners.push_back(K);
-                                break;
-                            }
-                        }
-                        if (owners.size() == 2) break; // 内部面最多两个tet
-                    }
-                    if (owners.size() == 2) break;
-                }
-                if (owners.size() == 2) break;
+// 指定的 3-tet 切分（用于“内部剖分面”）
+struct Tet { int v[4]; };
+inline std::array<Tet,3> prism_split_3tets(const std::array<int,3>& a,
+                                           const std::array<int,3>& b){
+    // T0={a0,a1,a2,b2}, T1={a0,a1,b1,b2}, T2={a0,b0,b1,b2}
+    return {{
+        Tet{ a[0], a[1], a[2], b[2] },
+        Tet{ a[0], a[1], b[1], b[2] },
+        Tet{ a[0], b[0], b[1], b[2] }
+    }};
+}
+
+// ============ 辅助：对一个三角做一次“CP/eb”并回写到 eb_min ============
+template<typename Tfp>
+inline void consider_triangle_and_update_ebmin(
+    int a,int b,int c,
+    const Tfp* U_fp,const Tfp* V_fp,
+    std::vector<Tfp>& eb_min, size_t &cp_count)
+{
+    // CP 检测（定点）
+    int64_t vf[3][2] = {
+        { (int64_t)U_fp[a], (int64_t)V_fp[a] },
+        { (int64_t)U_fp[b], (int64_t)V_fp[b] },
+        { (int64_t)U_fp[c], (int64_t)V_fp[c] }
+    };
+    int idxs[3] = {a,b,c};
+    if (ftk::robust_critical_point_in_simplex2(vf, idxs)) {
+        eb_min[a]=0; eb_min[b]=0; eb_min[c]=0;
+        cp_count++;
+        return;
+    }
+    // eb 推导（一次）
+    Tfp eb = derive_cp_abs_eb_sos_online<Tfp>(
+                U_fp[a],U_fp[b],U_fp[c],
+                V_fp[a],V_fp[b],V_fp[c]);
+    if (eb < eb_min[a]) eb_min[a]=eb;
+    if (eb < eb_min[b]) eb_min[b]=eb;
+    if (eb < eb_min[c]) eb_min[c]=eb;
+}
+
+// ================== 全局唯一三角遍历 + 内部面 ==================
+// 思路：对每个 slab [t,t+1]
+//   (1) 底面：cell(i,j) 的 Upper/Lower（只在层 t 发一次）
+//   (2) 侧面：以“边×时间”为基本单元（横/竖/对角 v00-v11），统一拆成两三角——全局唯一
+//   (3) 内部剖分面：按您的 3-tet 切分，每个棱柱发两张内部面（只归属本棱柱）
+//   (4) 顶面：仅在最后一个 slab（t==T-2）把层 t+1 的 Upper/Lower 发一次
+template<typename Tfp>
+inline void accumulate_eb_min_global_unique_with_internal(
+    const Size3& sz, const Tfp* U_fp, const Tfp* V_fp,
+    std::vector<Tfp>& eb_min)
+{
+    const int H=sz.H, W=sz.W, T=sz.T;
+    const int dv = H*W; // = sk
+    size_t cp_count =0;
+
+    for (int t=0; t<T-1; ++t){
+        if (t % 100 == 0){
+            printf("processing slab %d / %d\n", t, T-1);
+        }
+        // -------- (1) 底面：每 cell 两三角（仅层 t） --------
+        for (int i=0; i<H-1; ++i){
+            int base_i   = vid(t,i,0,sz);
+            int base_ip1 = vid(t,i+1,0,sz);
+            for (int j=0; j<W-1; ++j){
+                int v00 = base_i   + j;
+                int v01 = base_i   + (j+1);
+                int v10 = base_ip1 + j;
+                int v11 = base_ip1 + (j+1);
+                // Upper: (v00,v01,v11)
+                consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count);
+                // Lower: (v00,v10,v11)
+                consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count);
             }
-            if (owners.size() == 2) break;
         }
-        if (owners.size() == 2) break;
-    }
-    return owners; // 0（未命中）/1（边界）/2（内部）
-}
 
-// ========== 简单的二进制读取工具 ==========
-static bool read_floats(const std::string& path, std::vector<float>& out, size_t expected_count) {
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin) {
-        std::cerr << "[ERR] Cannot open file: " << path << "\n";
-        return false;
-    }
-    fin.seekg(0, std::ios::end);
-    std::streamsize bytes = fin.tellg();
-    fin.seekg(0, std::ios::beg);
-    if (bytes % sizeof(float) != 0) {
-        std::cerr << "[ERR] File size not multiple of 4 bytes: " << path << "\n";
-        return false;
-    }
-    size_t n = static_cast<size_t>(bytes / sizeof(float));
-    if (expected_count != 0 && n != expected_count) {
-        std::cerr << "[ERR] Count mismatch. File " << path << " has " << n
-                  << " floats, expected " << expected_count << ".\n";
-        return false;
-    }
-    out.resize(n);
-    if (!fin.read(reinterpret_cast<char*>(out.data()), bytes)) {
-        std::cerr << "[ERR] Failed to read file: " << path << "\n";
-        return false;
-    }
-    return true;
-}
-
-// ========== 便捷索引（可根据实际文件打平顺序调整）==========
-// 假设 linear id = t*(H*W) + i*W + j
-static inline size_t index_of(int i,int j,int t,const Size& sz) {
-    return static_cast<size_t>(t) * (sz.H * sz.W) + static_cast<size_t>(i) * sz.W + j;
-}
-
-// 返回一个四面体的 4 个三角面（未排序，保持“自然面”顶点次序）
-static inline std::array<std::array<int,3>,4> raw_faces_of_tet(const Tet& K) {
-    return {
-        std::array<int,3>{K.v[0], K.v[1], K.v[2]},
-        std::array<int,3>{K.v[0], K.v[1], K.v[3]},
-        std::array<int,3>{K.v[0], K.v[2], K.v[3]},
-        std::array<int,3>{K.v[1], K.v[2], K.v[3]}
-    };
-}
-
-
-
-// —— 新增：顶点位图（1bit/vertex），支持并发置位 ——
-// N = H*W*T 位（约 135,067,500 bit ≈ 16.1 MB）
-// 顶部：可选开关。并行写入同一位图时设为 1；单线程设为 0（默认）
-
-
-struct VertexBitmap {
-#if BITMAP_ATOMIC
-    std::vector<std::atomic<uint64_t>> words;
-#else
-    std::vector<uint64_t> words;
-#endif
-    size_t nbits = 0;
-
-    void init(size_t nbits_) {
-        nbits = nbits_;
-        size_t nw = (nbits + 63) >> 6;
-        words.resize(nw);
-#if BITMAP_ATOMIC
-        for (size_t i=0; i<nw; ++i) words[i].store(0, std::memory_order_relaxed);
-#else
-        std::fill(words.begin(), words.end(), 0ull);
-#endif
-    }
-
-    inline void set(size_t idx) {
-        size_t w = idx >> 6;
-        uint64_t mask = 1ull << (idx & 63);
-#if BITMAP_ATOMIC
-        words[w].fetch_or(mask, std::memory_order_relaxed);
-#else
-        words[w] |= mask; // 非原子，单线程下最快
-#endif
-    }
-
-    inline bool get(size_t idx) const {
-        size_t w = idx >> 6;
-        uint64_t mask = 1ull << (idx & 63);
-#if BITMAP_ATOMIC
-        uint64_t v = words[w].load(std::memory_order_relaxed);
-#else
-        uint64_t v = words[w];
-#endif
-        return (v & mask) != 0;
-    }
-
-    size_t count_ones() const {
-        size_t c=0;
-        for (size_t i=0;i<words.size();++i) {
-#if BITMAP_ATOMIC
-            uint64_t v = words[i].load(std::memory_order_relaxed);
-#else
-            uint64_t v = words[i];
-#endif
-#if __cpp_lib_bitops >= 201907L
-            c += std::popcount(v);
-#else
-            c += (size_t)__builtin_popcountll(v);
-#endif
+        // -------- (2) 侧面：边×时间 → 两三角（全局唯一） --------
+        // 2.1 横边 (i,j)-(i,j+1)
+        for (int i=0; i<H; ++i){
+            int row = vid(t,i,0,sz);
+            for (int j=0; j<W-1; ++j){
+                int a=row+j, b=a+1, ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+            }
         }
-        return c;
-    }
-};
+        // 2.2 竖边 (i,j)-(i+1,j)
+        for (int i=0; i<H-1; ++i){
+            int row_i   = vid(t,i,0,sz);
+            int row_ip1 = vid(t,i+1,0,sz);
+            for (int j=0; j<W; ++j){
+                int a=row_i+j, b=row_ip1+j, ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+            }
+        }
+        // 2.3 对角边 (i,j)-(i+1,j+1)（与三角网格一致，仅此一条对角）
+        for (int i=0; i<H-1; ++i){
+            int row_i   = vid(t,i,0,sz);
+            int row_ip1 = vid(t,i+1,0,sz);
+            for (int j=0; j<W-1; ++j){
+                int a=row_i+j, b=row_ip1+(j+1), ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+            }
+        }
 
-#pragma pack(push,1)
-struct UVPackHeader {
-    char     magic[8];     // "UVPACK\0"
-    uint32_t version;      // 1
-    uint32_t W, H, T;      // 网格维度
-    uint64_t Ntotal;       // W*H*T
-    uint64_t Mmarked;      // 被标记的顶点个数
-    uint8_t  value_kind;   // 0=f32(U/V)，1=i64_fixed(U_fp/V_fp)
-    uint8_t  reserved8[7]; // 对齐/扩展
-    int64_t  scale;        // 定点缩放因子（value_kind==1 有效）
-    int64_t  reserved64[3];// 预留
-};
-#pragma pack(pop)
+        // -------- (3) 内部剖分面：每棱柱两面（仅归属本棱柱） --------
+        for (int i=0; i<H-1; ++i){
+            for (int j=0; j<W-1; ++j){
+                // Upper prism
+                {
+                    auto a = tri_vertices_2d(i,j,TriInCell::Upper,t,sz);
+                    std::array<int,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
+                    // 两张内部面： (a0,a1,b2), (a0,b1,b2)
+                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                }
+                // Lower prism
+                {
+                    auto a = tri_vertices_2d(i,j,TriInCell::Lower,t,sz);
+                    std::array<int,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
+                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                }
+            }
+        }
 
-// “内存包”——仅驻留内存，不写文件
-struct UVPackMem {
-    UVPackHeader hdr{};
-    std::vector<uint32_t> indices;     // 升序唯一顶点ID
-    // 二选一：根据 hdr.value_kind 使用
-    std::vector<float>    Uvals, Vvals;      // value_kind==0
-    std::vector<int64_t>  Ufixed, Vfixed;    // value_kind==1
-};
-
-// 从位图提取升序唯一索引（沿用您现有 VertexBitmap）
-static std::vector<uint32_t> build_marked_indices(const VertexBitmap& bmp) {
-    const size_t nbits = bmp.nbits;
-    const size_t nw    = (nbits + 63) >> 6;
-    std::vector<uint32_t> out;
-    out.reserve(bmp.count_ones());
-    for (size_t w = 0; w < nw; ++w) {
-        uint64_t word =
-#if defined(BITMAP_ATOMIC) && BITMAP_ATOMIC
-            bmp.words[w].load(std::memory_order_relaxed);
-#else
-            bmp.words[w];
-#endif
-        while (word) {
-#if defined(_MSC_VER)
-            unsigned long tz; _BitScanForward64(&tz, word);
-            uint32_t bit = (uint32_t)tz;
-#else
-            uint32_t bit = (uint32_t)__builtin_ctzll(word);
-#endif
-            out.push_back((uint32_t)((w << 6) + bit));
-            word &= (word - 1); // 清最低位1
+        // -------- (4) 顶面：仅最后一片把层 t+1 发一次 --------
+        if (t==T-2){
+            int tp=t+1;
+            for (int i=0; i<H-1; ++i){
+                int base_i   = vid(tp,i,0,sz);
+                int base_ip1 = vid(tp,i+1,0,sz);
+                for (int j=0; j<W-1; ++j){
+                    int v00=base_i+j, v01=base_i+(j+1);
+                    int v10=base_ip1+j, v11=base_ip1+(j+1);
+                    consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count);
+                    consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count);
+                }
+            }
         }
     }
+    printf("total cp count = %ld\n",cp_count);
+}
+
+struct Metrics {
+    double min_orig = +std::numeric_limits<double>::infinity();
+    double max_orig = -std::numeric_limits<double>::infinity();
+    double min_recon= +std::numeric_limits<double>::infinity();
+    double max_recon= -std::numeric_limits<double>::infinity();
+    double max_abs_err = 0.0;
+    double max_rel_err = 0.0;
+    double rmse = 0.0;
+    double nrmse = 0.0;
+    double psnr = 0.0;
+};
+
+template<typename T>
+static inline Metrics compute_metrics(const T* orig, const T* recon, size_t N, double eps=1e-30)
+{
+    Metrics m;
+    long double sse = 0.0L; // 用长双精度累加，降低数值误差
+
+    for (size_t i=0;i<N;++i){
+        const double o = static_cast<double>(orig[i]);
+        const double r = static_cast<double>(recon[i]);
+        const double e = std::abs(o - r);
+
+        m.min_orig  = std::min(m.min_orig,  o);
+        m.max_orig  = std::max(m.max_orig,  o);
+        m.min_recon = std::min(m.min_recon, r);
+        m.max_recon = std::max(m.max_recon, r);
+
+        m.max_abs_err = std::max(m.max_abs_err, e);
+        if (std::abs(o) > 1e-5){
+            m.max_rel_err = std::max(m.max_rel_err, e / std::abs(o));
+        }
+        const double de = (o - r);
+        sse += static_cast<long double>(de) * static_cast<long double>(de);
+    }
+
+    const double rmse = std::sqrt(static_cast<double>(sse / (N>0?N:1)));
+    m.rmse = rmse;
+
+    const double range = m.max_orig - m.min_orig; // 原始数据动态范围
+    m.nrmse = (range > 0.0) ? rmse / range : rmse;
+
+    if (rmse == 0.0){
+        m.psnr = std::numeric_limits<double>::infinity();
+    } else if (range > 0.0){
+        m.psnr = 20.0 * std::log10(range / rmse);
+    } else {
+        // 原始数据为常数场：以 |max_orig| 作为峰值尝试给出 PSNR，否则报告 -inf
+        const double peak = std::abs(m.max_orig);
+        m.psnr = (peak > 0.0) ? 20.0 * std::log10(peak / rmse)
+                              : -std::numeric_limits<double>::infinity();
+    }
+    return m;
+}
+
+static inline void print_metrics(const char* name, const Metrics& m)
+{
+    std::cout.setf(std::ios::fixed); std::cout<<std::setprecision(6);
+    std::cout << "["<<name<<"]\n"
+              << "  orig min/max : " << m.min_orig  << " / " << m.max_orig  << "\n"
+              << "  recon min/max: " << m.min_recon << " / " << m.max_recon << "\n"
+              << "  max |err|    : " << m.max_abs_err << "\n"
+              << "  max rel err  : " << m.max_rel_err << "\n"
+              << "  RMSE         : " << m.rmse  << "\n"
+              << "  NRMSE        : " << m.nrmse << "  (normalized by orig range)\n"
+              << "  PSNR [dB]    : " << m.psnr  << "\n";
+}
+
+// 入口：同时验证 U/V 以及合并后的整体（两分量拼接）
+template<typename T>
+static inline void verify(const T* U_orig, const T* V_orig,
+                          const T* U_recon, const T* V_recon,
+                          size_t r1, size_t r2, size_t r3,
+                          double eps=1e-30)
+{
+    const size_t N = r1*r2*r3;
+
+    Metrics mu = compute_metrics(U_orig, U_recon, N, eps);
+    Metrics mv = compute_metrics(V_orig, V_recon, N, eps);
+
+    // 合并统计（把 U/V 当作 2N 长度的单一序列）
+    // 这里避免额外分配，直接分别累计再合并
+    Metrics mall;
+    {
+        // 先 U
+        mall.min_orig  = std::min(mu.min_orig, mv.min_orig);
+        mall.max_orig  = std::max(mu.max_orig, mv.max_orig);
+        mall.min_recon = std::min(mu.min_recon, mv.min_recon);
+        mall.max_recon = std::max(mu.max_recon, mv.max_recon);
+        mall.max_abs_err = std::max(mu.max_abs_err, mv.max_abs_err);
+        mall.max_rel_err = std::max(mu.max_rel_err, mv.max_rel_err);
+
+        // RMSE 合并（基于 SSE 累加）
+        const long double sse_u = static_cast<long double>(mu.rmse) * mu.rmse * N;
+        const long double sse_v = static_cast<long double>(mv.rmse) * mv.rmse * N;
+        const size_t      Nall  = 2*N;
+        const double rmse_all = std::sqrt(static_cast<double>((sse_u + sse_v) / (Nall>0?Nall:1)));
+        mall.rmse = rmse_all;
+
+        const double range_all = (mall.max_orig - mall.min_orig);
+        mall.nrmse = (range_all>0.0) ? (rmse_all / range_all) : rmse_all;
+        if (rmse_all == 0.0){
+            mall.psnr = std::numeric_limits<double>::infinity();
+        } else if (range_all > 0.0){
+            mall.psnr = 20.0 * std::log10(range_all / rmse_all);
+        } else {
+            const double peak = std::max(std::abs(mall.max_orig), std::abs(mall.min_orig));
+            mall.psnr = (peak>0.0) ? 20.0*std::log10(peak / rmse_all)
+                                   : -std::numeric_limits<double>::infinity();
+        }
+    }
+
+    // 打印
+    print_metrics("U", mu);
+    print_metrics("V", mv);
+    print_metrics("U+V (combined)", mall);
+}
+
+// ========== 误差模式 ==========
+enum class EbMode : uint8_t { Absolute=0, Relative=1 };
+
+
+// ================== 压缩主函数（时间最慢 + 全局唯一三角 + 内部面） ==================
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_fp(
+    const T_data* U, const T_data* V,
+    size_t r1, size_t r2, size_t r3,      // r1=H, r2=W, r3=T
+    size_t& compressed_size,
+    EbMode mode,                          // 误差模式
+    double eb_param                       // Absolute: 相对range的因子；Relative: 相对比例 r
+){
+    using T = int64_t;
+    const Size3 sz{ (int)r1,(int)r2,(int)r3 };
+    const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
+
+    // 0) 定点化
+    T* U_fp=(T*)std::malloc(N*sizeof(T));
+    T* V_fp=(T*)std::malloc(N*sizeof(T));
+    if(!U_fp || !V_fp){ if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp); compressed_size=0; return nullptr; }
+    T range=0, scale=convert_to_fixed_point<T_data,T>(U,V,N,U_fp,V_fp,range);
+
+    // 参数
+    const int   base=2; const double log_of_base=std::log2(base);
+    const int   capacity=65536; const int intv_radius=(capacity>>1);
+    const T     threshold=1;
+    const T     eb_floor = 1; // 防止过小 eb
+    const T     max_abs_eb = (mode==EbMode::Absolute)
+                            ? (T)std::llround((long double)range * (long double)eb_param)
+                            : std::numeric_limits<T>::max();
+
+    // 1) eb_min 预计算
+    std::vector<T> eb_min(N, max_abs_eb);
+    accumulate_eb_min_global_unique_with_internal(sz, U_fp, V_fp, eb_min);
+
+    // 2) Lorenzo + 量化 + Huffman
+    int* eb_q  = (int*)std::malloc(N*sizeof(int));
+    int* dq    = (int*)std::malloc(2*N*sizeof(int)); // U/V 交错
+    if(!eb_q || !dq){
+        if(eb_q) std::free(eb_q); if(dq) std::free(dq);
+        std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+    }
+    int* eb_q_pos=eb_q; int* dq_pos=dq;
+    std::vector<T_data> unpred; unpred.reserve(N/10*2);
+
+    const ptrdiff_t si=W, sj=1, sk=(ptrdiff_t)(H*W);
+
+    for (int t=0; t<(int)Tt; ++t){
+        if (t % 100 == 0){
+            //printf("processing slab %d / %d\n", t, Tt);
+        }
+        for (int i=0; i<(int)H; ++i){
+            for (int j=0; j<(int)W; ++j){
+                const ptrdiff_t v = (ptrdiff_t)vid(t,i,j,sz);
+
+                // 误差设定：模式 → eb_setting
+                T eb_setting = max_abs_eb;
+                if (mode==EbMode::Relative){
+                    // 相对误差（基于定点幅度的 L_inf ）
+                    T amp = std::max<T>( std::llabs(U_fp[v]), std::llabs(V_fp[v]) );
+                    long double cand = (long double)amp * (long double)eb_param;
+                    if (cand > (long double)std::numeric_limits<T>::max()) cand = (long double)std::numeric_limits<T>::max();
+                    eb_setting = (T)std::llround(cand);
+                }
+                // CP 约束收紧 + floor
+                T abs_eb = std::min<T>( eb_setting, eb_min[v] );
+                // if (abs_eb < eb_floor) abs_eb = eb_floor;
+
+                // 量化 eb（按引用，abs_eb 被替换为离散代表值）
+                int eb_idx = eb_exponential_quantize(abs_eb, base, log_of_base, threshold);
+                *eb_q_pos = eb_idx;
+
+                if (abs_eb > 0){
+                    bool unp=false;
+                    T dec[2];
+                    const T* pos[2] = { U_fp+v, V_fp+v };
+                    for (int p=0; p<2; ++p){
+                        const T* cur = pos[p];
+                        T curv = *cur;
+                        // 3D 一阶 Lorenzo（时间最慢）
+                        T d0 = (t&&i&&j)? cur[-sk - si - sj]:0;
+                        T d1 = (t&&i)   ? cur[-sk - si]     :0;
+                        T d2 = (t&&j)   ? cur[-sk - sj]     :0;
+                        T d3 = (t)      ? cur[-sk]          :0;
+                        T d4 = (i&&j)   ? cur[-si - sj]     :0;
+                        T d5 = (i)      ? cur[-si]          :0;
+                        T d6 = (j)      ? cur[-sj]          :0;
+                        T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
+                        T diff = curv - pred;
+
+                        T qd = (std::llabs(diff)/abs_eb) + 1;
+                        if (qd < capacity){
+                            qd = (diff>0) ? qd : -qd;
+                            int qidx = int(qd/2) + intv_radius;
+                            dq_pos[p] = qidx;
+                            dec[p] = pred + 2*(qidx-intv_radius)*abs_eb;
+                            if (std::llabs(dec[p]-curv) >= abs_eb){ unp=true; break; }
+                        } else { unp=true; break; }
+                    }
+                    if (unp){
+                        *(eb_q_pos++) = 0;
+                        unpred.push_back(U[v]);
+                        unpred.push_back(V[v]);
+                    } else {
+                        ++eb_q_pos;
+                        dq_pos += 2;
+                        U_fp[v] = dec[0];
+                        V_fp[v] = dec[1];
+                    }
+                }else{
+                    *(eb_q_pos++) = 0;
+                    unpred.push_back(U[v]);
+                    unpred.push_back(V[v]);
+                }
+            }
+        }
+    }
+
+    // 3) 打包：加上误差模式与参数（便于排查 / 统计）
+    unsigned char* out = (unsigned char*)std::malloc( (size_t) (2*N*sizeof(T)) );
+    unsigned char* pos = out;
+    write_variable_to_dst(pos, scale);
+    write_variable_to_dst(pos, base);
+    write_variable_to_dst(pos, threshold);
+    write_variable_to_dst(pos, intv_radius);
+
+    // 新增：误差模式与参数
+    uint8_t mode_byte = static_cast<uint8_t>(mode);
+    write_variable_to_dst(pos, mode_byte);
+    double eb_param_d = eb_param;
+    write_variable_to_dst(pos, eb_param_d);
+
+    size_t unpred_cnt = unpred.size();
+    write_variable_to_dst(pos, unpred_cnt);
+    if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
+
+    size_t eb_num = (size_t)(eb_q_pos - eb_q);
+    write_variable_to_dst(pos, eb_num);
+    Huffman_encode_tree_and_data(/*state_num=*/1024, eb_q, eb_num, pos);
+    std::free(eb_q);
+
+    size_t dq_num = (size_t)(dq_pos - dq);
+    write_variable_to_dst(pos, dq_num);
+    Huffman_encode_tree_and_data(/*state_num=*/65536, dq, dq_num, pos);
+    std::free(dq);
+
+    compressed_size = (size_t)(pos - out);
+    std::free(U_fp); std::free(V_fp);
     return out;
 }
-
-// 在内存中“打包”标记顶点的U/V（float或定点）——不写盘
-static UVPackMem build_uv_pack_in_memory(
-        uint32_t W, uint32_t H, uint32_t T,
-        const VertexBitmap& bmp,
-        const std::vector<uint32_t>& marked_idx,           // 可传 build_marked_indices 的结果
-        const std::vector<float>& U, const std::vector<float>& V,
-        bool use_fixed_point,                              // true: 使用 U_fp/V_fp
-        const std::vector<int64_t>* U_fp,                  // 若 use_fixed_point=true，必须提供
-        const std::vector<int64_t>* V_fp,
-        int64_t scale_if_fixed)                            // 定点缩放因子
+// ---------------- 解压主函数 ----------------
+template<typename T_data>
+bool sz_decompress_cp_preserve_sos_2p5d_fp(
+    const unsigned char* compressed,
+    size_t r1, size_t r2, size_t r3,
+    T_data*& U, T_data*& V)
 {
-    UVPackMem pack;
-    std::memset(&pack.hdr, 0, sizeof(pack.hdr));
-    std::memcpy(pack.hdr.magic, "UVPACK\0", 8);
-    pack.hdr.version   = 1;
-    pack.hdr.W         = W; pack.hdr.H = H; pack.hdr.T = T;
-    pack.hdr.Ntotal    = (uint64_t)W * H * T;
-    pack.hdr.Mmarked   = marked_idx.size();
-    pack.hdr.value_kind= use_fixed_point ? 1 : 0;
-    pack.hdr.scale     = use_fixed_point ? scale_if_fixed : 0;
+    using T = int64_t;
+    const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
 
-    pack.indices = marked_idx; // 拷贝索引
+    if (U) std::free(U);
+    if (V) std::free(V);
 
-    if (!use_fixed_point) {
-        pack.Uvals.resize(marked_idx.size());
-        pack.Vvals.resize(marked_idx.size());
-        for (size_t k=0; k<marked_idx.size(); ++k) {
-            uint32_t id = marked_idx[k];
-            pack.Uvals[k] = U[id];
-            pack.Vvals[k] = V[id];
-        }
-    } else {
-        if (!U_fp || !V_fp) {
-            std::cerr << "[ERR] build_uv_pack_in_memory: missing fixed-point arrays.\n";
-            return pack;
-        }
-        pack.Ufixed.resize(marked_idx.size());
-        pack.Vfixed.resize(marked_idx.size());
-        for (size_t k=0; k<marked_idx.size(); ++k) {
-            uint32_t id = marked_idx[k];
-            pack.Ufixed[k] = (*U_fp)[id];
-            pack.Vfixed[k] = (*V_fp)[id];
+    // 头部
+    const unsigned char* p = compressed;
+    T scale=0; read_variable_from_src(p, scale);
+    int base=0; read_variable_from_src(p, base);
+    T threshold=0; read_variable_from_src(p, threshold);
+    int intv_radius=0; read_variable_from_src(p, intv_radius);
+    const int capacity = (intv_radius<<1);
+
+    // 读取误差模式与参数（当前不参与重建，仅用于一致性/调试）
+    uint8_t mode_byte=0; read_variable_from_src(p, mode_byte);
+    double eb_param=0.0; read_variable_from_src(p, eb_param);
+    (void)mode_byte; (void)eb_param;
+
+    size_t unpred_cnt=0; read_variable_from_src(p, unpred_cnt);
+    if (unpred_cnt % 2 != 0) return false;
+
+    const T_data* unpred_data = reinterpret_cast<const T_data*>(p);
+    const T_data* unpred_pos  = unpred_data;
+    p += unpred_cnt * sizeof(T_data);
+
+    size_t eb_num=0; read_variable_from_src(p, eb_num);
+    int* eb_idx = Huffman_decode_tree_and_data(/*state_num=*/1024, eb_num, p);
+    if (!eb_idx) return false;
+
+    size_t dq_num=0; read_variable_from_src(p, dq_num);
+    int* dq = Huffman_decode_tree_and_data(/*state_num=*/65536, dq_num, p);
+    if (!dq){ std::free(eb_idx); return false; }
+
+    if (eb_num != N) { std::free(eb_idx); std::free(dq); return false; }
+    const size_t n_unpred_points = unpred_cnt/2;
+    if (dq_num != 2*(N - n_unpred_points)) { std::free(eb_idx); std::free(dq); return false; }
+
+    // 定点缓冲
+    T* U_fp=(T*)std::malloc(N*sizeof(T));
+    T* V_fp=(T*)std::malloc(N*sizeof(T));
+    if(!U_fp || !V_fp){ if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp);
+        std::free(eb_idx); std::free(dq); return false; }
+
+    T* U_pos=U_fp; T* V_pos=V_fp;
+    int* eb_pos=eb_idx; int* dq_pos=dq;
+    std::vector<size_t> unpred_indices; unpred_indices.reserve(n_unpred_points);
+
+    const ptrdiff_t si=W, sj=1, sk=(ptrdiff_t)(H*W);
+
+    for (int t=0; t<(int)Tt; ++t){
+        for (int i=0; i<(int)H; ++i){
+            for (int j=0; j<(int)W; ++j){
+                int ebid = *eb_pos++;
+
+                if (ebid == 0){
+                    size_t off = (size_t)(U_pos - U_fp);
+                    unpred_indices.push_back(off);
+                    *U_pos = (T)std::llround((long double)(*unpred_pos++) * (long double)scale);
+                    *V_pos = (T)std::llround((long double)(*unpred_pos++) * (long double)scale);
+                } else {
+                    long double eb_ld = std::pow((long double)base, (long double)ebid)
+                                      * (long double)threshold;
+                    T abs_eb = (T)std::llround(eb_ld);
+
+                    for (int pcomp=0; pcomp<2; ++pcomp){
+                        T* cur = (pcomp==0) ? U_pos : V_pos;
+                        T d0 = (t&&i&&j)? cur[-sk - si - sj]:0;
+                        T d1 = (t&&i)   ? cur[-sk - si]     : 0;
+                        T d2 = (t&&j)   ? cur[-sk - sj]     : 0;
+                        T d3 = (t)      ? cur[-sk]          : 0;
+                        T d4 = (i&&j)   ? cur[-si - sj]     : 0;
+                        T d5 = (i)      ? cur[-si]          : 0;
+                        T d6 = (j)      ? cur[-sj]          : 0;
+                        T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
+
+                        int qidx = *dq_pos++;
+                        *cur = pred + (T) (2LL * ( (long long)qidx - (long long)intv_radius ) ) * abs_eb;
+                    }
+                }
+                ++U_pos; ++V_pos;
+            }
         }
     }
-    return pack;
-}
 
-// 从“内存包”回填到 U/V 数组（用于解压后替换回去）
-static bool apply_marked_uv_from_memory(
-        const UVPackMem& pack,
-        std::vector<float>& U, std::vector<float>& V)
-{
-    const uint64_t Nexpect = (uint64_t)U.size();
-    if (pack.hdr.Ntotal != Nexpect || pack.hdr.Ntotal != V.size()) {
-        std::cerr << "[ERR] apply_from_memory: size mismatch.\n";
+    // 回浮点并覆盖不可预测点
+    U = (T_data*)std::malloc(N*sizeof(T_data));
+    V = (T_data*)std::malloc(N*sizeof(T_data));
+    if(!U || !V){
+        std::free(U); std::free(V);
+        std::free(U_fp); std::free(V_fp);
+        std::free(eb_idx); std::free(dq);
         return false;
     }
-    if (pack.hdr.value_kind == 0) {
-        if (pack.Uvals.size() != pack.indices.size() || pack.Vvals.size() != pack.indices.size()) {
-            std::cerr << "[ERR] apply_from_memory: payload size mismatch (float).\n";
-            return false;
-        }
-        for (size_t k=0; k<pack.indices.size(); ++k) {
-            uint32_t id = pack.indices[k];
-            U[id] = pack.Uvals[k];
-            V[id] = pack.Vvals[k];
-        }
-    } else if (pack.hdr.value_kind == 1) {
-        if (pack.Ufixed.size() != pack.indices.size() || pack.Vfixed.size() != pack.indices.size()) {
-            std::cerr << "[ERR] apply_from_memory: payload size mismatch (fixed).\n";
-            return false;
-        }
-        const double inv = (pack.hdr.scale != 0 ? 1.0/double(pack.hdr.scale) : 1.0);
-        for (size_t k=0; k<pack.indices.size(); ++k) {
-            uint32_t id = pack.indices[k];
-            U[id] = float(double(pack.Ufixed[k]) * inv);
-            V[id] = float(double(pack.Vfixed[k]) * inv);
-        }
-    } else {
-        std::cerr << "[ERR] apply_from_memory: unknown value_kind.\n";
-        return false;
+    convert_to_floating_point(U_fp, V_fp, N, U, V, scale);
+
+    unpred_pos = unpred_data;
+    for (size_t off : unpred_indices){
+        U[off] = *unpred_pos++;
+        V[off] = *unpred_pos++;
     }
+
+    std::free(U_fp); std::free(V_fp);
+    std::free(eb_idx); std::free(dq);
     return true;
 }
 
-
 int main(int argc, char** argv) {
-    print_omp_runtime_info("BOOT");
-    // ---- 配置区 ----
-    // 尺寸：W=450, H=150, T=2000
-    Size sz{ .H = 150, .W = 450, .T = 2001 };
-
     // 文件路径：可从命令行传入；否则用默认名
     std::string u_path = (argc > 1 ? argv[1] : "u.bin");
     std::string v_path = (argc > 2 ? argv[2] : "v.bin");
-
-    // 打印的最大面数（避免海量输出）；需要全部打印可改成 very large
-    const size_t MAX_PRINT = 50;  // <- 修改这里
-
-    // ---- 读取数据 ----
-    const size_t N = static_cast<size_t>(sz.H) * sz.W * sz.T;
-    std::vector<float> U, V;
-    if (!read_floats(u_path, U, N)) return 1;
-    if (!read_floats(v_path, V, N)) return 1;
-    std::vector<int64_t> U_fp(N), V_fp(N);
-    int64_t range = 0;
-    int64_t vector_field_scaling_factor = convert_to_fixed_point(U.data(), V.data(), N, U_fp.data(), V_fp.data(), range);
-
-    std::cout << "Loaded U and V: count=" << N << " floats each.\n";
-    std::cout << "Grid: W="<<sz.W<<", H="<<sz.H<<", T="<<sz.T<<"\n\n";
-
-    // —— 位图初始化 —— 
-    VertexBitmap vbmp;
-    vbmp.init(N);
-
-    // ---- 遍历所有四面体 → 遍历其 4 个面，并打印每个面的三顶点的 (u,v) ----
-    // 说明：这是“逐面打印”。若担心重复（共面会在两个 tet 都出现），
-    // 可改为“分片构建面哈希取 unique face 再打印”。此处直接按需求逐面输出。
-    size_t printed = 0, total_faces = 0, total_tets = 0, face_contain_cp = 0, total_unique_faces = 0;
-
-    //add timing
-    auto start = std::chrono::high_resolution_clock::now();
-
-    #if 0
-    //TODO: 相邻的两个四面体会有一个面重复计算了一次
-    traverse_all_tets_stream(sz,
-        [&](int i, int j, int t, TriInCell which, int k, const Tet& K,
-            const std::array<FaceKey,4>& /*faces_sorted*/)
-        {
-            ++total_tets;
-            auto faces_raw = raw_faces_of_tet(K);
-            for (int f = 0; f < 4; ++f) {
-                ++total_faces;
-                // if (printed < MAX_PRINT) {
-                    const auto& tri = faces_raw[f];
-                    int a = tri[0], b = tri[1], c = tri[2];
-
-                    // 取出 (i,j,t) 坐标（仅用于演示可读性；实际上直接按 id 取值即可）
-                    auto fetch_uv = [&](int vid)->std::pair<float,float> {
-                        // 由顶点 id 反推出 (t,i,j) 仅用于 sanity check / 打印；不需要也可省略
-                        // 反解：t = vid / (H*W), r = vid % (H*W), i = r / W, j = r % W
-                        // 注意：这是“反演”，仅用于断言，可注释以提速。
-                        // const int layer = vid / (sz.H * sz.W);
-                        // const int rem   = vid % (sz.H * sz.W);
-                        // const int ii    = rem / sz.W;
-                        // const int jj    = rem % sz.W;
-                        // assert(index_of(ii,jj,layer,sz) == static_cast<size_t>(vid));
-                        float u = U[static_cast<size_t>(vid)];
-                        float v = V[static_cast<size_t>(vid)];
-                        return {u,v};
-                    };
-
-                    auto fetch_uv_fp = [&](int vid)->std::pair<int64_t,int64_t> { //fix point
-                        int64_t u_fp = U_fp[static_cast<size_t>(vid)];
-                        int64_t v_fp = V_fp[static_cast<size_t>(vid)];
-                        return {u_fp, v_fp};
-                    };
-
-                    auto [ua_fp,va_fp] = fetch_uv_fp(a);
-                    auto [ub_fp,vb_fp] = fetch_uv_fp(b);
-                    auto [uc_fp,vc_fp] = fetch_uv_fp(c);
-
-                    auto [ua,va] = fetch_uv(a);
-                    auto [ub,vb] = fetch_uv(b);
-                    auto [uc,vc] = fetch_uv(c);
-
-                    //move the value of ua,ub,uc and va,vb,vc to vf[3][2]
-                    int64_t vf[3][2];
-                    vf[0][0] = ua_fp; vf[0][1] = va_fp;
-                    vf[1][0] = ub_fp; vf[1][1] = vb_fp;
-                    vf[2][0] = uc_fp; vf[2][1] = vc_fp;
-
-                    double v[3][2]; //convert float to double
-                    v[0][0] = static_cast<double>(ua); v[0][1] = static_cast<double>(va);
-                    v[1][0] = static_cast<double>(ub); v[1][1] = static_cast<double>(vb);
-                    v[2][0] = static_cast<double>(uc); v[2][1] = static_cast<double>(vc);
-
-                    // std::cout << "Face vertices = {"<<a<<","<<b<<","<<c<<"}\n"
-                    //           << "  U = {"<<ua<<","<<ub<<","<<uc<<"}\n"
-                    //           << "  V = {"<<va<<","<<vb<<","<<vc<<"}\n";
-                    // std::cout << "  U_fp = {"<<ua_fp<<","<<ub_fp<<","<<uc_fp<<"}\n"
-                    //           << "  V_fp = {"<<va_fp<<","<<vb_fp<<","<<vc_fp<<"}\n";
-                    // ++printed;
-
-                    //计算cp-sos
-                    // robust critical point test
-                    int indices[3];
-                    indices[0] = a; indices[1] = b; indices[2] = c;
-                    // std::cout << "  indices = {"<<indices[0]<<","<<indices[1]<<","<<indices[2]<<"}\n";
-                    // std::cout << "  vf = {"<<vf[0][0]<<","<<vf[0][1]<<","<<vf[1][0]<<","<<vf[1][1]<<","<<vf[2][0]<<","<<vf[2][1]<<"}\n";
-                    bool succ = ftk::robust_critical_point_in_simplex2(vf, indices);
-                    if (succ) {
-                        std::cout << "  robust_critical_point_in_simplex2 = true indices = {" << indices[0] << "," << indices[1] << "," << indices[2] << "}\n";
-                    }
-                    if (!succ) return false;
-
-                    double mu[3]; // check intersection
-                    double cond;
-                    bool succ2 = ftk::inverse_lerp_s2v2(v, mu, &cond);
-                    // if (!succ2) return false;
-                    // if (std::isnan(mu[0]) || std::isnan(mu[1]) || std::isnan(mu[2])) return false;
-                    // fprintf(stderr, "mu=%f, %f, %f\n", mu[0], mu[1], mu[2]);
-
-                    if (!succ2){
-                        ftk::clamp_barycentric<3>(mu);
-                    }
-                    double X[3][4], x[4]; // position
-                    for (int i = 0; i < 3; ++i) {
-                        // X[i][0] => x, X[i][1] => y, X[i][2] => z(zero), X[i][3] => t
-                        //X[i][0] : p mod W
-                        //X[i][1] : p / W mod H
-                        X[i][0] = static_cast<double>(indices[i] % sz.W);
-                        X[i][1] = static_cast<double>((indices[i] / sz.W) % sz.H);
-                        X[i][2] = 0.0; // 2D plane, z
-                        X[i][3] = static_cast<double>(indices[i] / (sz.W * sz.H));
-                    }
-                    //print X
-                    for (int i = 0; i < 3; ++i) {
-                        std::cout << "X[" << i << "] = {";
-                        for (int j = 0; j < 4; ++j) {
-                            std::cout << X[i][j];
-                            if (j < 3) std::cout << ", ";
-                        }
-                        std::cout << "}\n";
-                    }
-                    ftk::lerp_s2v4(X, mu, x);
-                    //print x coord
-                    std::cout << "x[0] = " << x[0] << "\n";
-                    std::cout << "x[1] = " << x[1] << "\n";
-                    std::cout << "x[2] = " << x[2] << "\n";
-                    std::cout << "x[t] = " << x[3] << "\n";
-                    face_contain_cp++;
-                // }
-            }
-        });
-    std::cout << "\nTotal tets traversed : " << total_tets  << "\n";
-    std::cout << "Total faces visited   : " << total_faces << " (4 per tet)\n";
-    std::cout << "Printed faces         : " << printed     << " (capped by MAX_PRINT="<<MAX_PRINT<<")\n";
-    std::cout << "Faces containing CP   : " << face_contain_cp << "\n";
-    #endif
-
-    auto fetch_uv     = [&](int vid)->std::pair<float,float>   { return { U[vid],    V[vid]    }; };
-    auto fetch_uv_fp  = [&](int vid)->std::pair<int64_t,int64_t>{ return { U_fp[vid], V_fp[vid] }; };
-
-    auto decode = [&](int p, double &X0,double &X1,double &X3){
-        X0 = (double)(p % sz.W);
-        X1 = (double)((p / sz.W) % sz.H);
-        X3 = (double)(p / (sz.W * sz.H));
-    };
-
-    traverse_unique_faces_across_slabs(sz,[&](int i, int j, int t, TriInCell which, int a, int b, int c)
-    {
-        ++total_unique_faces;
-
-        // 取 U/V（float 与定点）
-        auto [ua,va]     = fetch_uv(a);
-        auto [ub,vb]     = fetch_uv(b);
-        auto [uc,vc]     = fetch_uv(c);
-        auto [ua_fp,va_fp] = fetch_uv_fp(a);
-        auto [ub_fp,vb_fp] = fetch_uv_fp(b);
-        auto [uc_fp,vc_fp] = fetch_uv_fp(c);
-
-        int64_t vf[3][2] = { {ua_fp,va_fp}, {ub_fp,vb_fp}, {uc_fp,vc_fp} };
-        double  v3[3][2] = { {(double)ua,(double)va}, {(double)ub,(double)vb}, {(double)uc,(double)vc} };
-
-        // robust-cp判定
-        int indices[3] = { a,b,c };
-        bool succ = ftk::robust_critical_point_in_simplex2(vf, indices);
-        if (!succ) return;  // 本面不含 CP，直接跳过
-
-        // —— 命中：位图置位（线程安全，原子 OR） ——
-        vbmp.set((size_t)a);
-        vbmp.set((size_t)b);
-        vbmp.set((size_t)c);
-        ++face_contain_cp;
-
-        // 反插值与位置
-        double mu[3], cond;
-        bool succ2 = ftk::inverse_lerp_s2v2(v3, mu, &cond);
-        if (!succ2) ftk::clamp_barycentric<3>(mu);
-
-        double X[3][4], x[4];
-        decode(a, X[0][0], X[0][1], X[0][3]); X[0][2]=0.0;
-        decode(b, X[1][0], X[1][1], X[1][3]); X[1][2]=0.0;
-        decode(c, X[2][0], X[2][1], X[2][3]); X[2][2]=0.0;
-        ftk::lerp_s2v4(X, mu, x);
-        std::cout << "CP on face {"<<a<<","<<b<<","<<c<<"}, x=("
-        << x[0] << "," << x[1] << "," << x[2] << ", t=" << x[3] << ")\n";
-        }
-    );
-    std::cout << "\nTotal unique faces visited : " << total_unique_faces << "\n";
-    std::cout << "Faces containing CP        : " << face_contain_cp    << "\n";
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-    std::cout << "traverse Time taken: " << duration.count() << " seconds.\n";
-    //print out number of 1 in bitmap
-    std::cout << "Number of 1s in bitmap: " << vbmp.count_ones() << "\n";
-
-    // 从位图拿到所有被置位的顶点索引（升序唯一）
-    auto marked_idx = build_marked_indices(vbmp);
-    std::cout << "Marked vertices in bitmap = " << marked_idx.size() << "\n";
-
-    // 构建内存包（两种模式：float 或 定点）
-    bool use_fixed_point = true; // fp or float
-    UVPackMem pack = build_uv_pack_in_memory(
-        /*W*/ sz.W, /*H*/ sz.H, /*T*/ sz.T,
-        /*bmp*/ vbmp,
-        /*marked_idx*/ marked_idx,
-        /*U,V*/ U, V,
-        /*use_fixed_point*/ use_fixed_point,
-        /*U_fp,V_fp*/ use_fixed_point ? &U_fp : nullptr,
-        /*V_fp*/     use_fixed_point ? &V_fp : nullptr,
-        /*scale*/    use_fixed_point ? vector_field_scaling_factor : 0
-    );
-    printf("number of lossless = %llu\n", use_fixed_point ? pack.Ufixed.size() : pack.Uvals.size());
-
-    // start = std::chrono::high_resolution_clock::now();
-    // // —— 准备一个示例面：取 (i=100,j=111,t=222,Upper) 的第一个tet的第0个面 —— 
-    // const int dv = sz.H * sz.W;
-    // auto v_t   = tri_vertices_2d(/*i=*/100, /*j=*/111, TriInCell::Upper, /*t=*/222, sz);
-    // std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-    // auto T = prism_split_3tets(v_t, v_tp1);
-    // Tet sampleK = T[0];
-    // auto sampleFaces = faces_of_tet_local(sampleK);
-    // auto f0 = sampleFaces[0].v; // (a,b,c)
-
-    // // —— 功能2：给定三点(面)→查相邻tet —— 
-    // std::cout << "[2] Query adjacent tets of face("
-    //           << f0[0] << "," << f0[1] << "," << f0[2] << ")...\n";
-    // auto adj = find_adjacent_tets_by_face(sz, f0[0], f0[1], f0[2]);
-    // if (adj.empty()) {
-    //     std::cout << "  No owner tet found (face not present).\n";
-    // } else {
-    //     std::cout << "  Owners (" << adj.size() << "):\n";
-    //     for (const auto& K : adj) {
-    //         std::cout << "    {"<<K.v[0]<<","<<K.v[1]<<","<<K.v[2]<<","<<K.v[3]<<"}\n";
-    //     }
-    // }
-    // std::cout << "\n";
-
-    // // —— 功能3：给定四点(四面体)→列出其四个面 —— 
-    // std::cout << "[3] Faces of tet {"<<sampleK.v[0]<<","<<sampleK.v[1]
-    //           << ","<<sampleK.v[2]<<","<<sampleK.v[3]<<"}:\n";
-    // for (const auto& fk : sampleFaces) {
-    //     auto v = fk.v;
-    //     std::cout << "  ("<<v[0]<<","<<v[1]<<","<<v[2]<<")\n";
-    // }
-
-    // std::cout << "\nDone.\n";
+    EbMode mode;
+    std::string mode_str = (argc > 3 ? argv[3] : "abs");
+    if(mode_str == "abs") {
+        mode = EbMode::Absolute;
+        printf("selected mode: absolute\n");
+    }
     
-    // end = std::chrono::high_resolution_clock::now();
-    // duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-    // std::cout << "Query Time taken: " << duration.count() << " seconds.\n";
+    else if(mode_str == "rel") {
+        mode = EbMode::Relative;
+        printf("selected mode: relative\n");
+    }
+    else{
+        std::cerr << "[ERR] unknown mode: " << mode_str << "\n";
+        return 1;
+    }
+    //read data
+    size_t num_elements =0;
+    float * U_ptr = readfile<float>(u_path.c_str(),num_elements);
+    float * V_ptr = readfile<float>(v_path.c_str(),num_elements);
+    //调用压缩
+    auto start_t = std::chrono::high_resolution_clock::now();
+    size_t compressed_size = 0;
+    unsigned char* compressed =
+        sz_compress_cp_preserve_sos_2p5d_fp<float>(
+    U_ptr, V_ptr, 450, 150, 2001, compressed_size, mode,0.01);
 
-    // // ---- 示例：给定一个“面”的三顶点 id，快速拿到它的 (u,v) 三元组并打印 ----
-    // // 这里演示用第一个打印过的面的三顶点（若未打印则跳过）
-    // if (printed > 0) {
-    //     // 为了示例，我们在上面打印循环中无法直接保留 tri；这里再构造一个面来演示：
-    //     // 选取 t=0, i=0, j=0, which=Upper 的第一个 tet 的第0个面
-    //     const int dv = sz.H * sz.W;
-    //     auto v_t   = tri_vertices_2d(0,0,TriInCell::Upper,0,sz);
-    //     std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-    //     auto T = prism_split_3tets(v_t, v_tp1);
-    //     auto tri = raw_faces_of_tet(T[0])[0];
-    //     int a=tri[0], b=tri[1], c=tri[2];
+    if (!compressed){
+        std::cerr << "[ERR] compression returned null.\n";
+        return 2;
+    }
+    unsigned char * result_after_lossless = NULL;
+    size_t lossless_outsize = sz_lossless_compress(ZSTD_COMPRESSOR, 3, compressed, compressed_size, &result_after_lossless);
+    //释放返回的缓冲区（由函数 malloc 分配）
+    std::free(compressed);
+    auto end_t = std::chrono::high_resolution_clock::now();
+    cout << "compression time in sec:" << std::chrono::duration<double>(end_t - start_t).count() << endl;
+    cout << "compressed size (after lossless): " << lossless_outsize << " bytes." << "ratio = " << (2*num_elements*sizeof(float))/double(lossless_outsize) << endl;
+    
+    //调用解压
+    unsigned char * decompressed = NULL;
+    size_t decompressed_size = sz_lossless_decompress(ZSTD_COMPRESSOR,result_after_lossless, lossless_outsize, &decompressed,compressed_size);
+    //释放返回的缓冲区（由函数 malloc 分配）
+    std::free(result_after_lossless);
+    if (!decompressed){
+        std::cerr << "[ERR] lossless decompression returned null.\n";
+        return 3;
+    }
+    //调用sz_decompress_cp_preserve_sos_2p5d_online_fp
+    float * U_dec = NULL;
+    float * V_dec = NULL;
+    int H = 450;
+    int W = 150;
+    int T = 2001;
+    printf("start decompression...\n");
+    sz_decompress_cp_preserve_sos_2p5d_fp<float>(decompressed, H, W, T, U_dec, V_dec);
 
-    //     auto uv = [&](int vid){ return std::pair<float,float>(U[vid], V[vid]); };
-    //     auto [ua,va] = uv(a);
-    //     auto [ub,vb] = uv(b);
-    //     auto [uc,vc] = uv(c);
+    //verify
+    printf("start verify...\n");
+    float * U_ori = readfile<float>(u_path.c_str(),num_elements);
+    float * V_ori = readfile<float>(v_path.c_str(),num_elements);
+    verify(U_ori, V_ori, U_dec, V_dec, H, W, T);
+    //check cp_count for U_dec and V_dec
+    printf("calculating cp_count for decompressed data...\n");
+    const Size3 sz{ (int)H,(int)W,(int)T };
+    int64_t* U_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    int64_t* V_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    int64_t range=0, scale=convert_to_fixed_point<float,int64_t>(U_dec,V_dec,num_elements,U_fp,V_fp,range);
+    std::vector<int64_t> eb_min(num_elements, 0.01);
+    accumulate_eb_min_global_unique_with_internal(sz, U_fp, V_fp, eb_min);
 
-    //     std::cout << "\n[Demo] Query one face again: {"<<a<<","<<b<<","<<c<<"}\n"
-    //               << "  U = {"<<ua<<","<<ub<<","<<uc<<"}\n"
-    //               << "  V = {"<<va<<","<<vb<<","<<vc<<"}\n";
-    // }
 
     return 0;
 }
-
-
-// int main(int argc, char** argv) {
-//     // 为演示起见使用较小网格。真实大网格(如150×450×2000)请直接替换数值；
-//     // 代码会以“流式分片”遍历，内存占用可控。
-//     Size sz{ .H = 150, .W = 450, .T = 1000 };
-
-//     // —— 功能1：遍历所有四面体及其四个面（流式，不存全量）——
-//     std::cout << "[1] Streaming traverse all tets (printing first few)...\n";
-//     std::size_t total_tets = 0, printed = 0;
-//     traverse_all_tets_stream(sz,
-//         [&](int i, int j, int t, TriInCell w, int k, const Tet& K, const std::array<FaceKey,4>& faces){
-//             ++total_tets;
-//             if (printed < 6) {
-//                 std::cout << "  Tet(i="<<i<<", j="<<j<<", t="<<t
-//                           << ", which="<<(w==TriInCell::Upper?"U":"L")
-//                           << ", k="<<k<<") = {"
-//                           << K.v[0]<<","<<K.v[1]<<","<<K.v[2]<<","<<K.v[3]<<"}\n";
-//                 for (int f=0; f<4; ++f) {
-//                     auto v = faces[f].v;
-//                     std::cout << "    face"<<f<<"=("<<v[0]<<","<<v[1]<<","<<v[2]<<")\n";
-//                 }
-//                 ++printed;
-//             }
-//         });
-//     std::cout << "  Total tets traversed = " << total_tets << "\n\n";
-
-//     // —— 准备一个示例面：取 (i=0,j=0,t=0,Upper) 的第一个tet的第0个面 —— 
-//     const int dv = sz.H * sz.W;
-//     auto v_t   = tri_vertices_2d(/*i=*/0, /*j=*/0, TriInCell::Upper, /*t=*/0, sz);
-//     std::array<int,3> v_tp1{ v_t[0]+dv, v_t[1]+dv, v_t[2]+dv };
-//     auto T = prism_split_3tets(v_t, v_tp1);
-//     Tet sampleK = T[0];
-//     auto sampleFaces = faces_of_tet_local(sampleK);
-//     auto f0 = sampleFaces[0].v; // (a,b,c)
-
-//     // —— 功能2：给定三点(面)→查相邻tet —— 
-//     std::cout << "[2] Query adjacent tets of face("
-//               << f0[0] << "," << f0[1] << "," << f0[2] << ")...\n";
-//     auto adj = find_adjacent_tets_by_face(sz, f0[0], f0[1], f0[2]);
-//     if (adj.empty()) {
-//         std::cout << "  No owner tet found (face not present).\n";
-//     } else {
-//         std::cout << "  Owners (" << adj.size() << "):\n";
-//         for (const auto& K : adj) {
-//             std::cout << "    {"<<K.v[0]<<","<<K.v[1]<<","<<K.v[2]<<","<<K.v[3]<<"}\n";
-//         }
-//     }
-//     std::cout << "\n";
-
-//     // —— 功能3：给定四点(四面体)→列出其四个面 —— 
-//     std::cout << "[3] Faces of tet {"<<sampleK.v[0]<<","<<sampleK.v[1]
-//               << ","<<sampleK.v[2]<<","<<sampleK.v[3]<<"}:\n";
-//     for (const auto& fk : sampleFaces) {
-//         auto v = fk.v;
-//         std::cout << "  ("<<v[0]<<","<<v[1]<<","<<v[2]<<")\n";
-//     }
-
-//     std::cout << "\nDone.\n";
-//     return 0;
-// }
