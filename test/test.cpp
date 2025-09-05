@@ -94,23 +94,48 @@ convert_to_floating_point(const T_fp * U_fp, const T_fp * V_fp, size_t num_eleme
 
 // ================== 网格/索引基础 ==================
 struct Size3 { int H, W, T; }; // H=450, W=150, T=2001
-inline int vid(int t,int i,int j,const Size3& sz){
+inline size_t vid(int t,int i,int j,const Size3& sz){
     return t*(sz.H*sz.W) + i*sz.W + j; // 时间最慢
 }
 enum class TriInCell : unsigned char { Upper=0, Lower=1 };
 
 // cell(i,j) 内，两种2D三角（底/顶层都用相同拓扑）
-inline std::array<int,3> tri_vertices_2d(int i,int j,TriInCell which,int t,const Size3& sz){
-    const int v00=vid(t,i,  j,  sz), v01=vid(t,i,  j+1,sz),
+inline std::array<size_t,3> tri_vertices_2d(int i,int j,TriInCell which,int t,const Size3& sz){
+    const size_t v00=vid(t,i,  j,  sz), v01=vid(t,i,  j+1,sz),
               v10=vid(t,i+1,j,  sz), v11=vid(t,i+1,j+1,sz);
-    return (which==TriInCell::Upper) ? std::array<int,3>{v00,v01,v11}
-                                     : std::array<int,3>{v00,v10,v11};
+    return (which==TriInCell::Upper) ? std::array<size_t,3>{v00,v01,v11}
+                                     : std::array<size_t,3>{v00,v10,v11};
+}
+
+inline std::vector<size_t> all_connected_vertices(size_t vertice_idx, const Size3& sz){
+    std::vector<size_t> neighbors;
+    int t = vertice_idx / (sz.H * sz.W);
+    int rem = vertice_idx % (sz.H * sz.W);
+    int i = rem / sz.W;
+    int j = rem % sz.W;
+
+    // 3D grid neighbors (6-connectivity)
+    for (int dt = -1; dt <= 1; ++dt) {
+        for (int di = -1; di <= 1; ++di) {
+            for (int dj = -1; dj <= 1; ++dj) {
+                if (std::abs(dt) + std::abs(di) + std::abs(dj) == 1) { // only direct neighbors
+                    int nt = t + dt;
+                    int ni = i + di;
+                    int nj = j + dj;
+                    if (nt >= 0 && nt < sz.T && ni >= 0 && ni < sz.H && nj >= 0 && nj < sz.W) {
+                        neighbors.push_back(vid(nt, ni, nj, sz));
+                    }
+                }
+            }
+        }
+    }
+    return neighbors;
 }
 
 // 指定的 3-tet 切分（用于“内部剖分面”）
-struct Tet { int v[4]; };
-inline std::array<Tet,3> prism_split_3tets(const std::array<int,3>& a,
-                                           const std::array<int,3>& b){
+struct Tet { size_t v[4]; };
+inline std::array<Tet,3> prism_split_3tets(const std::array<size_t,3>& a,
+                                           const std::array<size_t,3>& b){
     // T0={a0,a1,a2,b2}, T1={a0,a1,b1,b2}, T2={a0,b0,b1,b2}
     return {{
         Tet{ a[0], a[1], a[2], b[2] },
@@ -119,12 +144,187 @@ inline std::array<Tet,3> prism_split_3tets(const std::array<int,3>& a,
     }};
 }
 
+// -------- 面键（无向三角，升序） ----------
+struct FaceKeySZ {
+  std::array<size_t,3> v;
+  FaceKeySZ() = default;
+  FaceKeySZ(size_t a,size_t b,size_t c){ v = {a,b,c}; std::sort(v.begin(), v.end()); }
+  bool operator==(const FaceKeySZ& o) const { return v == o.v; }
+};
+struct FaceKeySZHash {
+  size_t operator()(const FaceKeySZ& k) const noexcept {
+    uint64_t h = 1469598103934665603ull;
+    for (auto x : k.v){
+      uint64_t y = (uint64_t)x;
+      h ^= y + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2);
+    }
+    return (size_t)h;
+  }
+};
+
+template<typename T_fp>
+static inline bool face_has_cp_robust(size_t a,size_t b,size_t c,
+                                      const T_fp* U_fp, const T_fp* V_fp)
+{
+  auto to_int = [](size_t x)->int { return (int)x; }; // 如需超大网格可加范围检查
+  int idxs[3] = { to_int(a), to_int(b), to_int(c) };
+  long long vf[3][2] = {
+    { (long long)U_fp[a], (long long)V_fp[a] },
+    { (long long)U_fp[b], (long long)V_fp[b] },
+    { (long long)U_fp[c], (long long)V_fp[c] }
+  };
+  return ftk::robust_critical_point_in_simplex2(vf, idxs);
+}
+
+// =====================================================================
+// ===============  2.5D 全局 compute_cp （返回哈希集合）  ==============
+// =====================================================================
+template<typename T_fp>
+static std::unordered_set<FaceKeySZ, FaceKeySZHash>
+compute_cp_2p5d_faces(const T_fp* U_fp, const T_fp* V_fp,
+                      int H, int W, int T)
+{
+  std::unordered_set<FaceKeySZ, FaceKeySZHash> faces_with_cp;
+  faces_with_cp.reserve((size_t)(H*(size_t)W*(size_t)T / 8)); // 经验值，预留一些空间
+
+  const Size3 sz{H,W,T};
+  const size_t dv = (size_t)H * (size_t)W;
+  std::vector<int> cp_per_layer(T, 0);
+  std::vector<int> cp_per_slab(T-1, 0);
+
+  // ---------------- (1) 层内面：每一层 t ∈ [0..T-1] ----------------
+  for (int t=0; t<T; ++t){
+    if(t % 1000 == 0){
+      printf("pre-compute cp lower layer %d / %d\n", t, T);
+    }
+    for (int i=0; i<H-1; ++i){
+      for (int j=0; j<W-1; ++j){
+        size_t v00 = vid(t,i,  j,  sz);
+        size_t v01 = vid(t,i,  j+1,sz);
+        size_t v10 = vid(t,i+1,j,  sz);
+        size_t v11 = vid(t,i+1,j+1,sz);
+
+        // Upper: (v00,v01,v11)
+        if (face_has_cp_robust(v00,v01,v11, U_fp,V_fp)){
+            faces_with_cp.emplace(v00,v01,v11);
+            cp_per_layer[t]++;
+        }
+
+
+        // Lower: (v00,v10,v11)
+        if (face_has_cp_robust(v00,v10,v11, U_fp,V_fp)){
+            faces_with_cp.emplace(v00,v10,v11);
+            cp_per_layer[t]++;
+        }
+      }
+    }
+  }
+  
+  // print out number of cp each layer
+  for (int t=0; t<T; t+=10){
+      printf("  cp in layer %d = %d\n", t, cp_per_layer[t]);
+  }
+
+  // ---------------- (2) 侧面：片 [t, t+1]，t ∈ [0..T-2] ----------------
+  // 2.1 横边：i∈[0..H-1], j∈[0..W-2]
+  for (int t=0; t<T-1; ++t){
+    if(t % 1000 == 0){
+      printf("pre-compute cp side_hor layer %d / %d\n", t, T);
+    }
+    for (int i=0; i<H; ++i){
+      for (int j=0; j<W-1; ++j){
+        size_t a  = vid(t, i, j,   sz);
+        size_t b  = vid(t, i, j+1, sz);
+        size_t ap = a + dv, bp = b + dv;
+        // 两个侧三角
+        if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  faces_with_cp.emplace(a,b,bp);
+        if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) faces_with_cp.emplace(a,bp,ap);
+      }
+    }
+  }
+  // 2.2 竖边：i∈[0..H-2], j∈[0..W-1]
+  for (int t=0; t<T-1; ++t){
+    if(t % 1000 == 0){
+      printf("pre-compute cp side_ver layer %d / %d\n", t, T);
+    }
+    for (int i=0; i<H-1; ++i){
+      for (int j=0; j<W; ++j){
+        size_t a  = vid(t, i,   j, sz);
+        size_t b  = vid(t, i+1, j, sz);
+        size_t ap = a + dv, bp = b + dv;
+        if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  faces_with_cp.emplace(a,b,bp);
+        if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) faces_with_cp.emplace(a,bp,ap);
+      }
+    }
+  }
+  // 2.3 对角边：i∈[0..H-2], j∈[0..W-2]
+  for (int t=0; t<T-1; ++t){
+    if(t % 1000 == 0){
+      printf("pre-compute cp diag layer %d / %d\n", t, T);
+    }
+    for (int i=0; i<H-1; ++i){
+      for (int j=0; j<W-1; ++j){
+        size_t a  = vid(t, i,   j,   sz);
+        size_t b  = vid(t, i+1, j+1, sz);
+        size_t ap = a + dv, bp = b + dv;
+        if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  faces_with_cp.emplace(a,b,bp);
+        if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) faces_with_cp.emplace(a,bp,ap);
+      }
+    }
+  }
+
+  // ---------------- (3) 内部剖分面：按你的 3-tet 切分 ----------------
+  // 每个棱柱（由 cell (i,j) 的 Upper/Lower 三角沿时间 extrude）有 2 个内部三角面
+  // Upper 三角 a=(v00,v01,v11), b=a+dv -> 内部面: (a0,a1,b2), (a0,b1,b2)
+  // Lower 三角 a=(v00,v10,v11), b=a+dv -> 内部面: (a0,a1,b2), (a0,b1,b2)
+  for (int t=0; t<T-1; ++t){
+    if(t % 1000 == 0){
+      printf("pre-compute cp inside layer %d / %d\n", t, T);
+    }
+    for (int i=0; i<H-1; ++i){
+      for (int j=0; j<W-1; ++j){
+        // Upper
+        {
+          size_t a0 = vid(t,i,  j,  sz);
+          size_t a1 = vid(t,i,  j+1,sz);
+          size_t a2 = vid(t,i+1,j+1,sz);
+          size_t b0 = a0 + dv, b1 = a1 + dv, b2 = a2 + dv;
+
+          if (face_has_cp_robust(a0,a1,b2, U_fp,V_fp)) faces_with_cp.emplace(a0,a1,b2);
+          if (face_has_cp_robust(a0,b1,b2, U_fp,V_fp)) faces_with_cp.emplace(a0,b1,b2);
+        }
+        // Lower
+        {
+          size_t a0 = vid(t,i,  j,  sz);
+          size_t a1 = vid(t,i+1,j,  sz);
+          size_t a2 = vid(t,i+1,j+1,sz);
+          size_t b0 = a0 + dv, b1 = a1 + dv, b2 = a2 + dv;
+
+          if (face_has_cp_robust(a0,a1,b2, U_fp,V_fp)) faces_with_cp.emplace(a0,a1,b2);
+          if (face_has_cp_robust(a0,b1,b2, U_fp,V_fp)) faces_with_cp.emplace(a0,b1,b2);
+        }
+      }
+    }
+  }
+
+
+  return faces_with_cp;
+}
+
+// -------- 便捷查询（可在逐顶点流程里用）----------
+static inline bool has_cp(const std::unordered_set<FaceKeySZ,FaceKeySZHash>& cp_faces,
+                          size_t a,size_t b,size_t c)
+{
+  return cp_faces.find(FaceKeySZ(a,b,c)) != cp_faces.end();
+}
+
+
 // ============ 辅助：对一个三角做一次“CP/eb”并回写到 eb_min ============
 template<typename Tfp>
 inline void consider_triangle_and_update_ebmin(
-    int a,int b,int c,
+    size_t a,size_t b,size_t c,
     const Tfp* U_fp,const Tfp* V_fp,
-    std::vector<Tfp>& eb_min, size_t &cp_count)
+    std::vector<Tfp>& eb_min, size_t &cp_count, std::vector<int> &cp_vector,int time_dim)
 {
     // CP 检测（定点）
     int64_t vf[3][2] = {
@@ -132,10 +332,12 @@ inline void consider_triangle_and_update_ebmin(
         { (int64_t)U_fp[b], (int64_t)V_fp[b] },
         { (int64_t)U_fp[c], (int64_t)V_fp[c] }
     };
-    int idxs[3] = {a,b,c};
+    int idxs[3] = {static_cast<int>(a), static_cast<int>(b), static_cast<int>(c)}; //这里的idx只能用int..ftk的接口就是这样
+
     if (ftk::robust_critical_point_in_simplex2(vf, idxs)) {
         eb_min[a]=0; eb_min[b]=0; eb_min[c]=0;
         cp_count++;
+        cp_vector[time_dim]++;
         return;
     }
     // eb 推导（一次）
@@ -161,55 +363,58 @@ inline void accumulate_eb_min_global_unique_with_internal(
     const int H=sz.H, W=sz.W, T=sz.T;
     const int dv = H*W; // = sk
     size_t cp_count =0;
+    std::vector<int> cp_per_layer(T,0);
+    std::vector<int> cp_per_slab(T-1,0);
 
     for (int t=0; t<T-1; ++t){
+
         if (t % 100 == 0){
             printf("processing slab %d / %d\n", t, T-1);
         }
         // -------- (1) 底面：每 cell 两三角（仅层 t） --------
         for (int i=0; i<H-1; ++i){
-            int base_i   = vid(t,i,0,sz);
-            int base_ip1 = vid(t,i+1,0,sz);
+            size_t base_i   = vid(t,i,0,sz);
+            size_t base_ip1 = vid(t,i+1,0,sz);
             for (int j=0; j<W-1; ++j){
-                int v00 = base_i   + j;
-                int v01 = base_i   + (j+1);
-                int v10 = base_ip1 + j;
-                int v11 = base_ip1 + (j+1);
+                size_t v00 = base_i   + j;
+                size_t v01 = base_i   + (j+1);
+                size_t v10 = base_ip1 + j;
+                size_t v11 = base_ip1 + (j+1);
                 // Upper: (v00,v01,v11)
-                consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count);
+                consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count,cp_per_layer,t);
                 // Lower: (v00,v10,v11)
-                consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count);
+                consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count,cp_per_layer,t);
             }
         }
 
         // -------- (2) 侧面：边×时间 → 两三角（全局唯一） --------
         // 2.1 横边 (i,j)-(i,j+1)
         for (int i=0; i<H; ++i){
-            int row = vid(t,i,0,sz);
+            size_t row = vid(t,i,0,sz);
             for (int j=0; j<W-1; ++j){
-                int a=row+j, b=a+1, ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+                size_t a=row+j, b=a+1, ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
             }
         }
         // 2.2 竖边 (i,j)-(i+1,j)
         for (int i=0; i<H-1; ++i){
-            int row_i   = vid(t,i,0,sz);
-            int row_ip1 = vid(t,i+1,0,sz);
+            size_t row_i   = vid(t,i,0,sz);
+            size_t row_ip1 = vid(t,i+1,0,sz);
             for (int j=0; j<W; ++j){
-                int a=row_i+j, b=row_ip1+j, ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+                size_t a=row_i+j, b=row_ip1+j, ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
             }
         }
         // 2.3 对角边 (i,j)-(i+1,j+1)（与三角网格一致，仅此一条对角）
         for (int i=0; i<H-1; ++i){
-            int row_i   = vid(t,i,0,sz);
-            int row_ip1 = vid(t,i+1,0,sz);
+            size_t row_i   = vid(t,i,0,sz);
+            size_t row_ip1 = vid(t,i+1,0,sz);
             for (int j=0; j<W-1; ++j){
-                int a=row_i+j, b=row_ip1+(j+1), ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count);
+                size_t a=row_i+j, b=row_ip1+(j+1), ap=a+dv, bp=b+dv;
+                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
+                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
             }
         }
 
@@ -219,17 +424,17 @@ inline void accumulate_eb_min_global_unique_with_internal(
                 // Upper prism
                 {
                     auto a = tri_vertices_2d(i,j,TriInCell::Upper,t,sz);
-                    std::array<int,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
+                    std::array<size_t,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
                     // 两张内部面： (a0,a1,b2), (a0,b1,b2)
-                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count);
-                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
+                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
                 }
                 // Lower prism
                 {
                     auto a = tri_vertices_2d(i,j,TriInCell::Lower,t,sz);
-                    std::array<int,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
-                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count);
-                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count);
+                    std::array<size_t,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
+                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
+                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
                 }
             }
         }
@@ -238,11 +443,11 @@ inline void accumulate_eb_min_global_unique_with_internal(
         if (t==T-2){
             int tp=t+1;
             for (int i=0; i<H-1; ++i){
-                int base_i   = vid(tp,i,0,sz);
-                int base_ip1 = vid(tp,i+1,0,sz);
+                size_t base_i   = vid(tp,i,0,sz);
+                size_t base_ip1 = vid(tp,i+1,0,sz);
                 for (int j=0; j<W-1; ++j){
-                    int v00=base_i+j, v01=base_i+(j+1);
-                    int v10=base_ip1+j, v11=base_ip1+(j+1);
+                    size_t v00=base_i+j, v01=base_i+(j+1);
+                    size_t v10=base_ip1+j, v11=base_ip1+(j+1);
                     consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count);
                     consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count);
                 }
@@ -250,6 +455,10 @@ inline void accumulate_eb_min_global_unique_with_internal(
         }
     }
     printf("total cp count = %ld\n",cp_count);
+    for (int t=0; t<T; t+=10){
+        printf("  cp in layer %d = %d\n", t, cp_per_layer[t]);
+        printf("  cp in slab  %d = %d\n", t, (t<T-1)?cp_per_slab[t]:0);
+    }
 }
 
 struct Metrics {
@@ -265,7 +474,7 @@ struct Metrics {
 };
 
 template<typename T>
-static inline Metrics compute_metrics(const T* orig, const T* recon, size_t N, double eps=1e-30)
+static inline Metrics compute_metrics(const T* orig, const T* recon, size_t N)
 {
     Metrics m;
     long double sse = 0.0L; // 用长双精度累加，降低数值误差
@@ -324,13 +533,12 @@ static inline void print_metrics(const char* name, const Metrics& m)
 template<typename T>
 static inline void verify(const T* U_orig, const T* V_orig,
                           const T* U_recon, const T* V_recon,
-                          size_t r1, size_t r2, size_t r3,
-                          double eps=1e-30)
+                          size_t r1, size_t r2, size_t r3)
 {
     const size_t N = r1*r2*r3;
 
-    Metrics mu = compute_metrics(U_orig, U_recon, N, eps);
-    Metrics mv = compute_metrics(V_orig, V_recon, N, eps);
+    Metrics mu = compute_metrics(U_orig, U_recon, N);
+    Metrics mv = compute_metrics(V_orig, V_recon, N);
 
     // 合并统计（把 U/V 当作 2N 长度的单一序列）
     // 这里避免额外分配，直接分别累计再合并
@@ -373,6 +581,320 @@ static inline void verify(const T* U_orig, const T* V_orig,
 // ========== 误差模式 ==========
 enum class EbMode : uint8_t { Absolute=0, Relative=1 };
 
+// ===== 主函数：逐顶点 + CP 面集合 =====
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
+    const T_data* U, const T_data* V,
+    size_t r1, size_t r2, size_t r3,   // r1=H, r2=W, r3=T (时间最慢)
+    size_t& compressed_size,
+    double max_pwr_eb                  // 全局绝对误差上限：max_eb = range * max_pwr_eb
+){
+  using T = int64_t;
+  const Size3 sz{ (int)r1,(int)r2,(int)r3 };
+  const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
+
+  // 1) 定点化
+  T *U_fp=(T*)std::malloc(N*sizeof(T));
+  T *V_fp=(T*)std::malloc(N*sizeof(T));
+  if(!U_fp || !V_fp){ if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp); compressed_size=0; return nullptr; }
+  T range=0;
+  T scale = convert_to_fixed_point<T_data,T>(U, V, N, U_fp, V_fp, range);
+
+  // 2) 预计算：全局“含 CP 的三角面”集合（一次性，后续 O(1) 查询）
+  auto cp_faces = compute_cp_2p5d_faces<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  //print the size of cp_faces
+  std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
+  // 3) 量化/编码缓冲
+  int* eb_quant_index = (int*)std::malloc(N*sizeof(int));
+  int* data_quant_index = (int*)std::malloc(2*N*sizeof(int));
+  double enc_max_abs_eb_fp   = 0.0; //check 用
+  double enc_max_real_err_fp = 0.0;
+  if(!eb_quant_index || !data_quant_index){
+    if(eb_quant_index) std::free(eb_quant_index);
+    if(data_quant_index) std::free(data_quant_index);
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+  int* eb_pos = eb_quant_index;
+  int* dq_pos = data_quant_index;
+  std::vector<T_data> unpred; unpred.reserve((N/10)*2);
+
+  const int base = 2;
+  const double log_of_base = std::log2(base);
+  const int capacity = 65536;
+  const int intv_radius = (capacity >> 1);
+//   const T max_eb = range * max_pwr_eb; // 全局绝对误差上限max_eb
+  const T max_eb = (T) std::llround( (long double)max_pwr_eb * (long double)scale );
+  const T threshold = 1;
+  const T eb_floor = 1; // 防止为 0 的步长（量化后代表值）
+
+  // 4) 逐顶点：枚举与该顶点相关的三角面 → min eb
+  const ptrdiff_t si=(ptrdiff_t)W, sj=(ptrdiff_t)1, sk=(ptrdiff_t)(H*W);
+  const size_t dv = (size_t)H*(size_t)W;
+
+  // 6 个平面邻接方向（左右、上下、主对角）
+  const int di[6] = { 0,  0,  1, -1,  1, -1 };
+  const int dj[6] = { 1, -1,  0,  0,  1, -1 };
+
+  for (int t=0; t<(int)Tt; ++t){
+    if(t % 100 == 0){
+      printf("processing slice %d / %d\n", t, (int)Tt);
+    }
+    for (int i=0; i<(int)H; ++i){
+      for (int j=0; j<(int)W; ++j){
+        const size_t v = vid(t,i,j,sz);
+        // 进入单点处理前，先缓存原始定点值，便于自检统计：
+        T *curU = U_fp + v;
+        T *curV = V_fp + v;
+        const T curU_val = *curU;
+        const T curV_val = *curV;
+
+        // —— 收集最小 eb——
+        T required_eb = max_eb;
+
+        // (A) 层内 t：影响 (i-1..i, j-1..j) 的 4 个 cell，每 cell 两个三角
+        for (int ci=i-1; ci<=i && required_eb>0; ++ci){
+          if (!in_range(ci, (int)H-1)) continue;
+          for (int cj=j-1; cj<=j && required_eb>0; ++cj){
+            if (!in_range(cj, (int)W-1)) continue;
+
+            size_t v00 = vid(t,ci,  cj,  sz);
+            size_t v01 = vid(t,ci,  cj+1,sz);
+            size_t v10 = vid(t,ci+1,cj,  sz);
+            size_t v11 = vid(t,ci+1,cj+1,sz);
+
+            // Upper: (v00,v01,v11)
+            if (v==v00 || v==v01 || v==v11){
+              if (has_cp(cp_faces, v00,v01,v11)) { required_eb = 0; goto after_min_eb; }
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v00],U_fp[v01],U_fp[v11],
+                                                     V_fp[v00],V_fp[v01],V_fp[v11]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // Lower: (v00,v10,v11)
+            if (v==v00 || v==v10 || v==v11){
+              if (has_cp(cp_faces, v00,v10,v11)) { required_eb = 0; goto after_min_eb; }
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v00],U_fp[v10],U_fp[v11],
+                                                     V_fp[v00],V_fp[v10],V_fp[v11]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        // (B1) 侧面 [t, t+1]
+        if (t < (int)Tt-1 && required_eb>0){
+          for (int k=0; k<6 && required_eb>0; ++k){
+            int ni=i+di[k], nj=j+dj[k];
+            if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+            size_t a  = vid(t, i, j, sz);
+            size_t b  = vid(t, ni,nj, sz);
+            size_t ap = a + dv, bp = b + dv;
+            // (a,b,bp)
+            if (has_cp(cp_faces, a,b,bp)) { required_eb = 0; goto after_min_eb; }
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a],U_fp[b],U_fp[bp],
+                                                     V_fp[a],V_fp[b],V_fp[bp]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (a,bp,ap)
+            if (has_cp(cp_faces, a,bp,ap)) { required_eb = 0; goto after_min_eb; }
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a],U_fp[bp],U_fp[ap],
+                                                     V_fp[a],V_fp[bp],V_fp[ap]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        // (B2) 侧面 [t-1, t]
+        if (t > 0 && required_eb>0){
+          for (int k=0; k<6 && required_eb>0; ++k){
+            int ni=i+di[k], nj=j+dj[k];
+            if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+            size_t a  = vid(t-1, i, j, sz);
+            size_t b  = vid(t-1, ni,nj, sz);
+            size_t ap = a + dv; // = v
+            size_t bp = b + dv;
+            // (a,b,bp)
+            if (has_cp(cp_faces, a,b,bp)) { required_eb = 0; goto after_min_eb; }
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a],U_fp[b],U_fp[bp],
+                                                     V_fp[a],V_fp[b],V_fp[bp]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (a,bp,ap)
+            if (has_cp(cp_faces, a,bp,ap)) { required_eb = 0; goto after_min_eb; }
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a],U_fp[bp],U_fp[ap],
+                                                     V_fp[a],V_fp[bp],V_fp[ap]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        // (C) 内部剖分面：两片 ts ∈ {t, t-1}；每相邻 cell 的 Upper/Lower 各 2 面
+        if (required_eb>0){
+          auto eval_internal = [&](int ts)->bool{
+            if (!in_range(ts,(int)Tt-1)) return false;
+            for (int ci=i-1; ci<=i; ++ci){
+              if (!in_range(ci,(int)H-1)) continue;
+              for (int cj=j-1; cj<=j; ++cj){
+                if (!in_range(cj,(int)W-1)) continue;
+                // Upper: a=(v00,v01,v11), b=a+dv → (a0,a1,b2), (a0,b1,b2)
+                {
+                  size_t a0 = vid(ts,ci,  cj,  sz);
+                  size_t a1 = vid(ts,ci,  cj+1,sz);
+                  size_t a2 = vid(ts,ci+1,cj+1,sz);
+                  size_t b0 = a0+dv, b1=a1+dv, b2=a2+dv;
+                  if (v==a0 || v==a1 || v==b2){
+                    if (has_cp(cp_faces,a0,a1,b2)) { required_eb=0; return true; }
+                    T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a0],U_fp[a1],U_fp[b2],
+                                                           V_fp[a0],V_fp[a1],V_fp[b2]);
+                    if (eb < required_eb) required_eb = eb;
+                    if (required_eb==0) return true;
+                  }
+                  if (v==a0 || v==b1 || v==b2){
+                    if (has_cp(cp_faces,a0,b1,b2)) { required_eb=0; return true; }
+                    T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a0],U_fp[b1],U_fp[b2],
+                                                           V_fp[a0],V_fp[b1],V_fp[b2]);
+                    if (eb < required_eb) required_eb = eb;
+                    if (required_eb==0) return true;
+                  }
+                }
+                // Lower: a=(v00,v10,v11), b=a+dv → (a0,a1,b2), (a0,b1,b2)
+                {
+                  size_t a0 = vid(ts,ci,  cj,  sz);
+                  size_t a1 = vid(ts,ci+1,cj,  sz);
+                  size_t a2 = vid(ts,ci+1,cj+1,sz);
+                  size_t b0 = a0+dv, b1=a1+dv, b2=a2+dv;
+                  if (v==a0 || v==a1 || v==b2){
+                    if (has_cp(cp_faces,a0,a1,b2)) { required_eb=0; return true; }
+                    T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a0],U_fp[a1],U_fp[b2],
+                                                           V_fp[a0],V_fp[a1],V_fp[b2]);
+                    if (eb < required_eb) required_eb = eb;
+                    if (required_eb==0) return true;
+                  }
+                  if (v==a0 || v==b1 || v==b2){
+                    if (has_cp(cp_faces,a0,b1,b2)) { required_eb=0; return true; }
+                    T eb = derive_cp_abs_eb_sos_online<T>(U_fp[a0],U_fp[b1],U_fp[b2],
+                                                           V_fp[a0],V_fp[b1],V_fp[b2]);
+                    if (eb < required_eb) required_eb = eb;
+                    if (required_eb==0) return true;
+                  }
+                }
+              }
+            }
+            return false;
+          };
+          if (eval_internal(t)) goto after_min_eb;
+          if (eval_internal(t-1)) goto after_min_eb;
+        }
+
+      after_min_eb:
+        // —— 量化 eb 并压缩该顶点的 U/V —— 
+        {
+          T abs_eb = required_eb;
+          *eb_pos = eb_exponential_quantize(abs_eb, base, log_of_base, threshold);
+
+          if (abs_eb > 0){
+            bool unpred_flag=false;
+            T dec[2];
+            // T *curU = U_fp + v;
+            // T *curV = V_fp + v;
+            T abs_err_fp_q[2] = {0,0};
+
+
+            for (int p=0; p<2; ++p){
+              T *cur = (p==0)? curU : curV;
+              T  curv  = (p==0) ? curU_val : curV_val;
+
+              // 3D Lorenzo（时间最慢）
+              T d0 = (t&&i&&j)? cur[-sk - si - sj] : 0;
+              T d1 = (t&&i)   ? cur[-sk - si]      : 0;
+              T d2 = (t&&j)   ? cur[-sk - sj]      : 0;
+              T d3 = (t)      ? cur[-sk]           : 0;
+              T d4 = (i&&j)   ? cur[-si - sj]      : 0;
+              T d5 = (i)      ? cur[-si]           : 0;
+              T d6 = (j)      ? cur[-sj]           : 0;
+              T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
+
+              T diff = curv - pred;
+              T qd = (std::llabs(diff)/abs_eb) + 1;
+              if (qd < capacity){
+                qd = (diff > 0) ? qd : -qd;
+                int qindex = (int)(qd/2) + intv_radius;
+                dq_pos[p] = qindex;
+                dec[p] = pred + 2*(qindex - intv_radius)*abs_eb;
+                //if (std::llabs(dec[p]-curv) > required_eb){ unpred_flag=true; break; }
+                // **守门：必须用 abs_eb（实际传输的步长）校验**
+                if (std::llabs(dec[p] - curv) > abs_eb){
+                    unpred_flag = true;
+                    break;
+                }
+                // 暂存本分量的真实误差(定点)
+                abs_err_fp_q[p] = std::llabs(dec[p] - curv);
+              }else{
+                unpred_flag=true; break;
+              }
+            }
+
+            if (unpred_flag){
+              *(eb_pos++) = 0;
+              unpred.push_back(U[v]);
+              unpred.push_back(V[v]);
+            }else{
+                ++eb_pos;
+                dq_pos += 2;
+                *curU = dec[0];
+                *curV = dec[1];
+                // **编码端自检统计（浮点域）**
+                double abs_eb_fp = (double)abs_eb / (double)scale;
+                double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
+                double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
+                enc_max_abs_eb_fp   = std::max(enc_max_abs_eb_fp, abs_eb_fp);
+                enc_max_real_err_fp = std::max(enc_max_real_err_fp, std::max(err_u_fp, err_v_fp));
+            }
+          }else{
+            *(eb_pos++) = 0;
+            unpred.push_back(U[v]);
+            unpred.push_back(V[v]);
+          }
+        }
+      }
+    }
+  }
+
+    std::cerr << "[ENC] max abs_eb(fp) = " << enc_max_abs_eb_fp
+    << ", max actual |err|(fp) = " << enc_max_real_err_fp << "\n";
+  // 5) 打包码流（与 2D 版一致）
+  unsigned char *compressed = (unsigned char*)std::malloc( (size_t)(2*N*sizeof(T)) );
+  unsigned char *pos = compressed;
+
+  write_variable_to_dst(pos, scale);
+  printf("write scale = %ld\n", scale);
+  write_variable_to_dst(pos, base);
+  write_variable_to_dst(pos, threshold);
+  write_variable_to_dst(pos, intv_radius);
+
+  size_t unpred_cnt = unpred.size();
+  write_variable_to_dst(pos, unpred_cnt);
+  write_array_to_dst(pos, unpred.data(), unpred_cnt);
+
+  size_t eb_quant_num = (size_t)(eb_pos - eb_quant_index);
+  write_variable_to_dst(pos, eb_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_quant_index, eb_quant_num, pos);
+  std::free(eb_quant_index);
+
+  size_t data_quant_num = (size_t)(dq_pos - data_quant_index);
+  write_variable_to_dst(pos, data_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*capacity, data_quant_index, data_quant_num, pos);
+  std::free(data_quant_index);
+
+  compressed_size = (size_t)(pos - compressed);
+  std::free(U_fp); std::free(V_fp);
+  return compressed;
+}
+
 
 // ================== 压缩主函数（时间最慢 + 全局唯一三角 + 内部面） ==================
 template<typename T_data>
@@ -398,7 +920,7 @@ sz_compress_cp_preserve_sos_2p5d_fp(
     const int   base=2; const double log_of_base=std::log2(base);
     const int   capacity=65536; const int intv_radius=(capacity>>1);
     const T     threshold=1;
-    const T     eb_floor = 1; // 防止过小 eb
+    // const T     eb_floor = 1; // 防止过小 eb
     const T     max_abs_eb = (mode==EbMode::Absolute)
                             ? (T)std::llround((long double)range * (long double)eb_param)
                             : std::numeric_limits<T>::max();
@@ -498,11 +1020,11 @@ sz_compress_cp_preserve_sos_2p5d_fp(
     write_variable_to_dst(pos, threshold);
     write_variable_to_dst(pos, intv_radius);
 
-    // 新增：误差模式与参数
-    uint8_t mode_byte = static_cast<uint8_t>(mode);
-    write_variable_to_dst(pos, mode_byte);
-    double eb_param_d = eb_param;
-    write_variable_to_dst(pos, eb_param_d);
+    // // 新增：误差模式与参数
+    // uint8_t mode_byte = static_cast<uint8_t>(mode);
+    // write_variable_to_dst(pos, mode_byte);
+    // double eb_param_d = eb_param;
+    // write_variable_to_dst(pos, eb_param_d);
 
     size_t unpred_cnt = unpred.size();
     write_variable_to_dst(pos, unpred_cnt);
@@ -510,18 +1032,19 @@ sz_compress_cp_preserve_sos_2p5d_fp(
 
     size_t eb_num = (size_t)(eb_q_pos - eb_q);
     write_variable_to_dst(pos, eb_num);
-    Huffman_encode_tree_and_data(/*state_num=*/1024, eb_q, eb_num, pos);
+    Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_q, eb_num, pos);
     std::free(eb_q);
 
     size_t dq_num = (size_t)(dq_pos - dq);
     write_variable_to_dst(pos, dq_num);
-    Huffman_encode_tree_and_data(/*state_num=*/65536, dq, dq_num, pos);
+    Huffman_encode_tree_and_data(/*state_num=*/2*65536, dq, dq_num, pos);
     std::free(dq);
 
     compressed_size = (size_t)(pos - out);
     std::free(U_fp); std::free(V_fp);
     return out;
 }
+
 // ---------------- 解压主函数 ----------------
 template<typename T_data>
 bool sz_decompress_cp_preserve_sos_2p5d_fp(
@@ -538,15 +1061,19 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp(
     // 头部
     const unsigned char* p = compressed;
     T scale=0; read_variable_from_src(p, scale);
+    printf("read scale = %ld\n", scale);
     int base=0; read_variable_from_src(p, base);
+    printf("read base = %d\n", base);
     T threshold=0; read_variable_from_src(p, threshold);
+    printf("read threshold = %ld\n", threshold);
     int intv_radius=0; read_variable_from_src(p, intv_radius);
+    printf("read intv_radius = %d\n", intv_radius);
     const int capacity = (intv_radius<<1);
 
-    // 读取误差模式与参数（当前不参与重建，仅用于一致性/调试）
-    uint8_t mode_byte=0; read_variable_from_src(p, mode_byte);
-    double eb_param=0.0; read_variable_from_src(p, eb_param);
-    (void)mode_byte; (void)eb_param;
+    // // 读取误差模式与参数（当前不参与重建，仅用于一致性/调试）
+    // uint8_t mode_byte=0; read_variable_from_src(p, mode_byte);
+    // double eb_param=0.0; read_variable_from_src(p, eb_param);
+    // (void)mode_byte; (void)eb_param;
 
     size_t unpred_cnt=0; read_variable_from_src(p, unpred_cnt);
     if (unpred_cnt % 2 != 0) return false;
@@ -556,11 +1083,11 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp(
     p += unpred_cnt * sizeof(T_data);
 
     size_t eb_num=0; read_variable_from_src(p, eb_num);
-    int* eb_idx = Huffman_decode_tree_and_data(/*state_num=*/1024, eb_num, p);
+    int* eb_idx = Huffman_decode_tree_and_data(/*state_num=*/2*1024, eb_num, p);
     if (!eb_idx) return false;
 
     size_t dq_num=0; read_variable_from_src(p, dq_num);
-    int* dq = Huffman_decode_tree_and_data(/*state_num=*/65536, dq_num, p);
+    int* dq = Huffman_decode_tree_and_data(/*state_num=*/2*65536, dq_num, p);
     if (!dq){ std::free(eb_idx); return false; }
 
     if (eb_num != N) { std::free(eb_idx); std::free(dq); return false; }
@@ -587,12 +1114,14 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp(
                 if (ebid == 0){
                     size_t off = (size_t)(U_pos - U_fp);
                     unpred_indices.push_back(off);
-                    *U_pos = (T)std::llround((long double)(*unpred_pos++) * (long double)scale);
-                    *V_pos = (T)std::llround((long double)(*unpred_pos++) * (long double)scale);
-                } else {
-                    long double eb_ld = std::pow((long double)base, (long double)ebid)
-                                      * (long double)threshold;
-                    T abs_eb = (T)std::llround(eb_ld);
+                    *U_pos = *(unpred_pos++) * scale;
+                    *V_pos = *(unpred_pos++) * scale;
+                }
+
+                else {
+                    T abs_eb = pow(base,ebid) * threshold;
+                    //long double eb_ld = std::pow((long double)base, (long double)ebid) * (long double)threshold;
+                    //T abs_eb = (T)std::llround(eb_ld);
 
                     for (int pcomp=0; pcomp<2; ++pcomp){
                         T* cur = (pcomp==0) ? U_pos : V_pos;
@@ -606,7 +1135,8 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp(
                         T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
 
                         int qidx = *dq_pos++;
-                        *cur = pred + (T) (2LL * ( (long long)qidx - (long long)intv_radius ) ) * abs_eb;
+                        // *cur = pred + (T) (2LL * ( (long long)qidx - (long long)intv_radius ) ) * abs_eb;
+                        *cur = pred + 2* (qidx - intv_radius) * abs_eb;
                     }
                 }
                 ++U_pos; ++V_pos;
@@ -642,6 +1172,8 @@ int main(int argc, char** argv) {
     std::string v_path = (argc > 2 ? argv[2] : "v.bin");
     EbMode mode;
     std::string mode_str = (argc > 3 ? argv[3] : "abs");
+    double error_bound = (argc > 4 ? std::stod(argv[4]) : 0.01);
+    printf("use eb= %f\n", error_bound);
     if(mode_str == "abs") {
         mode = EbMode::Absolute;
         printf("selected mode: absolute\n");
@@ -662,14 +1194,18 @@ int main(int argc, char** argv) {
     //调用压缩
     auto start_t = std::chrono::high_resolution_clock::now();
     size_t compressed_size = 0;
-    unsigned char* compressed =
-        sz_compress_cp_preserve_sos_2p5d_fp<float>(
-    U_ptr, V_ptr, 450, 150, 2001, compressed_size, mode,0.01);
+    // unsigned char* compressed =
+    //     sz_compress_cp_preserve_sos_2p5d_fp<float>(
+    // U_ptr, V_ptr, 450, 150, 2001, compressed_size, mode,error_bound);
+    auto* compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
+    U_ptr, V_ptr, /*H=*/450, /*W=*/150, /*T=*/2001, //150,450,2001?
+    compressed_size, error_bound);
 
     if (!compressed){
         std::cerr << "[ERR] compression returned null.\n";
         return 2;
     }
+    // exit(0);
     unsigned char * result_after_lossless = NULL;
     size_t lossless_outsize = sz_lossless_compress(ZSTD_COMPRESSOR, 3, compressed, compressed_size, &result_after_lossless);
     //释放返回的缓冲区（由函数 malloc 分配）
@@ -697,18 +1233,26 @@ int main(int argc, char** argv) {
     sz_decompress_cp_preserve_sos_2p5d_fp<float>(decompressed, H, W, T, U_dec, V_dec);
 
     //verify
-    printf("start verify...\n");
+    printf("start verify....\n");
     float * U_ori = readfile<float>(u_path.c_str(),num_elements);
     float * V_ori = readfile<float>(v_path.c_str(),num_elements);
     verify(U_ori, V_ori, U_dec, V_dec, H, W, T);
     //check cp_count for U_dec and V_dec
-    printf("calculating cp_count for decompressed data...\n");
-    const Size3 sz{ (int)H,(int)W,(int)T };
-    int64_t* U_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    int64_t* V_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    int64_t range=0, scale=convert_to_fixed_point<float,int64_t>(U_dec,V_dec,num_elements,U_fp,V_fp,range);
-    std::vector<int64_t> eb_min(num_elements, 0.01);
-    accumulate_eb_min_global_unique_with_internal(sz, U_fp, V_fp, eb_min);
+    int64_t *U_dec_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    int64_t *V_dec_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    int64_t range_dec=0;
+    int64_t scale = convert_to_fixed_point<float,int64_t>(U_dec,V_dec,num_elements,U_dec_fp,V_dec_fp,range_dec);
+    auto cp_faces_dec = compute_cp_2p5d_faces(U_dec_fp, V_dec_fp, H, W, T);
+    std::cout << "Total faces with CP dec: " << cp_faces_dec.size() << std::endl;
+    exit(0);
+
+    // printf("calculating cp_count for decompressed data...\n");
+    // const Size3 sz{ (int)H,(int)W,(int)T };
+    // int64_t* U_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    // int64_t* V_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
+    // int64_t range=0, scale=convert_to_fixed_point<float,int64_t>(U_dec,V_dec,num_elements,U_fp,V_fp,range);
+    // std::vector<int64_t> eb_min(num_elements, 0.01);
+    // accumulate_eb_min_global_unique_with_internal(sz, U_fp, V_fp, eb_min);
 
 
     return 0;

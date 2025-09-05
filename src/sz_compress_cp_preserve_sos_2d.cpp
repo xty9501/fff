@@ -279,6 +279,38 @@ same_direction(T u0, T u1, T u2) {
 triangle mesh x0, x1, x2, derive cp-preserving eb for x2 given x0, x1
 using SoS method
 */
+// template<typename T>
+// static T 
+// derive_cp_abs_eb_sos_online(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2){
+// 	T M0 = u2*v0 - u0*v2;
+// 	T M1 = u1*v2 - u2*v1;
+// 	T M2 = u0*v1 - u1*v0;
+// 	T M = M0 + M1 + M2;
+// 	if(M == 0) return 0;
+// 	// keep sign for the original simplex
+// 	T eb = std::abs(M) / (std::abs(u1 - u0) + std::abs(v0 - v1));
+// 	{
+// 		// keep sign for replacing the first and second vertices
+// 		if(std::abs(u1) + std::abs(v1) != 0){
+// 			eb = MINF(eb, std::abs(u1*v2 - u2*v1) / (std::abs(u1) + std::abs(v1)));
+// 		}
+// 		else return 0;
+// 		if(std::abs(u0) + std::abs(v0) != 0){
+// 			eb = MINF(eb, std::abs(u0*v2 - u2*v0) / (std::abs(u0) + std::abs(v0)));			
+// 		}
+// 		else return 0;
+// 		// T cur_eb = MINF(std::abs(u1*v2 - u2*v1) / (std::abs(u1) + std::abs(v1)), std::abs(u0*v2 - u2*v0) / (std::abs(u0) + std::abs(v0)));
+// 		// eb = MINF(eb, cur_eb);
+// 	}
+// 	if(same_direction(u0, u1, u2)){			
+// 		eb = MAX(eb, std::abs(u2));
+// 	}
+// 	if(same_direction(v0, v1, v2)){			
+// 		eb = MAX(eb, std::abs(v2));
+// 	}
+// 	return eb;
+// }
+
 template<typename T>
 static T 
 derive_cp_abs_eb_sos_online(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2){
@@ -310,7 +342,6 @@ derive_cp_abs_eb_sos_online(const T u0, const T u1, const T u2, const T v0, cons
 	}
 	return eb;
 }
-
 template<typename T_fp>
 static int 
 check_cp(T_fp vf[3][2], int indices[3]){
