@@ -53,4 +53,8 @@ template<typename T>
 T
 derive_cp_abs_eb_sos_online(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2);
 
+template<typename T>
+T
+derive_cp_abs_eb_sos_online_symm(const T u0, const T u1, const T u2, const T v0, const T v1, const T v2);
+
 #endif

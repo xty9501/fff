@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <bit>
+#include <algorithm>
 
 template<typename T>
 using unpred_vec = std::vector<T>;
@@ -29,6 +31,71 @@ inline int eb_exponential_quantize(int64_t& eb, const int base, const double log
 	int id = log2(eb / threshold)/log_of_base;
 	eb = pow(base, id) * threshold;
 	return id;
+}
+
+// inline int eb_exponential_quantize_new(int64_t& eb, int64_t threshold=1) {
+//   if (eb <= threshold) { eb = 0; return 0; } // 0: unpred
+//   // base = 2
+//   uint64_t ratio = static_cast<uint64_t>(eb / threshold);
+//   int id = 63 - std::countl_zero(ratio);      // floor(log2(ratio))
+//   eb = threshold << id;                       // dequant step
+//   return id + 1;                              // 偏移 1 后写流
+// }
+
+// inline bool eb_dequant_from_id(int eid, int64_t threshold, int64_t& eb) {
+//   if (eid == 0) { eb = 0; return false; }     // unpred
+//   int id = eid - 1;
+//   if (id < 0 || id > 62) { id = std::clamp(id,0,62); }  // 保护
+//   eb = threshold << id;
+//   return true;                                // 预测路径
+// }
+
+// inline int eb_exponential_quantize_new(int64_t &eb, int64_t threshold){
+//     // eb <= threshold 时，用 id=1 表示“步长 = threshold”
+//     if (eb <= threshold){ eb = threshold; return 1; }
+//     // 向下取整到 {threshold, 2*threshold, 4*threshold, ...}
+//     uint64_t q = (uint64_t)(eb / threshold);   // floor(eb/th)
+//     int id = 0;                                // 得到最高位位置
+//     while (q){ ++id; q >>= 1; }
+//     eb = threshold << (id-1);                  // 代表值
+//     return id;                                 // id>=1
+// }
+
+// inline bool eb_dequant_from_id(int ebid, int64_t threshold, int64_t &eb){
+//     if (ebid <= 0){ eb = 0; return false; }    // 0 → 不可预测
+//     eb = threshold << (ebid-1);                // 与 eb_exponential_quantize_new 对应
+//     return true;
+// }
+
+// ---- eb 幂指数量化（向下取整到 {th, 2th, 4th, ...}；id>=1）+ 反量化 ----
+inline int eb_exponential_quantize_new(int64_t &eb, int64_t threshold){
+    // eb <= threshold 归到 id=1（代表值=threshold）
+    if (eb <= threshold){ eb = threshold; return 1; }
+
+    // 计算 floor(eb / threshold) 的最高位位置
+    uint64_t q = (uint64_t)(eb / threshold);
+#if __cpp_lib_bitops >= 201907L
+    int id = std::bit_width(q);          // C++20，有就用
+#else
+    int id = 0;                           // 退化实现
+    while (q){ ++id; q >>= 1; }
+#endif
+    // 代表值为 threshold << (id-1)
+    int shift = id - 1;
+    if (shift >= 62) {                    // 饱和保护
+        eb = (int64_t)std::numeric_limits<int64_t>::max();
+        return 63;
+    }
+    eb = threshold << shift;
+    return id;                            // id>=1
+}
+
+inline bool eb_dequant_from_id(int ebid, int64_t threshold, int64_t &eb){
+    if (ebid <= 0){ eb = 0; return false; }           // 0 → 无损/不可预测点
+    int shift = ebid - 1;
+    if (shift >= 62){ eb = (int64_t)std::numeric_limits<int64_t>::max(); return true; }
+    eb = threshold << shift;                           // 与量化严格配对
+    return true;
 }
 
 inline int eb_linear_quantize(double& eb, double threshold=1e-5){

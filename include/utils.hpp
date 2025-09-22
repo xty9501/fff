@@ -26,6 +26,29 @@ Type * readfile(const char * file, size_t& num){
 	return data;
 }
 
+template<typename T>
+void zero_small_values_inplace(T* data, size_t n, double eps = 1e-5){
+    if (!data || n==0) return;
+    if constexpr (std::is_floating_point<T>::value){
+        const double th = eps;
+        for (size_t i = 0; i < n; ++i){
+            if (std::fabs((double)data[i]) < th) data[i] = (T)0;
+        }
+    } else {
+        // 非浮点类型不处理：如果需要，可以改成静态断言
+        // static_assert(std::is_floating_point<T>::value, "T must be floating point");
+    }
+}
+
+// 读取并置零的封装（基于你现有的 readfile）
+template<typename T>
+T* readfile_and_zero(const char* file, size_t& num, double eps = 1e-5){
+    T* data = readfile<T>(file, num);
+    if (!data) return nullptr;
+    zero_small_values_inplace<T>(data, num, eps);
+    return data;
+}
+
 template<typename Type>
 void readfile_to_buffer(char * file, size_t& num, Type * data){
     std::ifstream fin(file, std::ios::binary);
