@@ -7,10 +7,13 @@
 #include <cstdio>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include "sz_huffman.hpp"
 #include <vector>
 
 using namespace std;
+
+enum class EbMode : uint8_t { Absolute = 0, Relative = 1 };
 
 template <typename T>
 union fp_int;
@@ -166,4 +169,3 @@ inline T MINF(const T& a, const T& b){
 #define LorenzeNoise3d 1.22
 
 #endif
-

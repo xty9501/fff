@@ -2,6 +2,9 @@
 #define _sz_compress_cp_preserve_2d_hpp
 
 #include <cstddef>
+#include <cstdint>
+
+#include "sz_def.hpp"
 
 #define DEFAULT_EB 0.1
 
@@ -23,7 +26,7 @@ sz_compress_cp_preserve_2d_online(const T * U, const T * V, size_t r1, size_t r2
 
 template<typename T>
 unsigned char *
-sz_compress_cp_preserve_sos_2d_time_online_fp(const T * U, const T * V, size_t r1, size_t r2, size_t time_dim, size_t& compressed_size, bool transpose=false, double max_pwr_eb=0.1);
+sz_compress_cp_preserve_sos_2d_time_online_fp(const T * U, const T * V, size_t r1, size_t r2, size_t time_dim, size_t& compressed_size, bool transpose=false, double max_pwr_eb=DEFAULT_EB, EbMode eb_mode=EbMode::Absolute);
 
 template<typename T>
 unsigned char *

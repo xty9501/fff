@@ -1,5 +1,19 @@
-// mesh_index_stream.hpp
+#define CP_DEBUG_VISIT 0
+#define DEBUG_USE 0
+#define VERBOSE 0
+#define VERIFY 0 //验证
+#define DETAIL 0 //详细
+#define CPSZ_BASELINE 1 //baseline results for cpsz
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include <atomic>
+#ifndef BITMAP_ATOMIC
+#define BITMAP_ATOMIC 0
+#endif
+
 #include <array>
 #include <vector>
 #include <unordered_map>
@@ -10,12 +24,7 @@
 #include <ftk/numeric/inverse_linear_interpolation_solver.hh>
 #include <ftk/numeric/clamp.hh>
 #include <ftk/numeric/linear_interpolation.hh>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-#ifndef BITMAP_ATOMIC
-#define BITMAP_ATOMIC 0
-#endif
+
 
 #include <cstdint>
 #include <cstring>
@@ -23,6 +32,7 @@
 #include <vector>
 #include <iostream>
 #include "sz_compress_cp_preserve_2d.hpp"
+#include "sz_decompress_cp_preserve_2d.hpp"
 #include "sz_cp_preserve_utils.hpp"
 #include "sz_def.hpp"
 #include "sz_compression_utils.hpp"
@@ -115,37 +125,30 @@ convert_to_floating_point(const T_fp * U_fp, const T_fp * V_fp, size_t num_eleme
 //         long double m = (a > b ? a : b);
 //         if (m > max_abs) max_abs = m;
 //     }
-
 //     // 2) 计算移位位数（base=2），并做安全夹取
 //     const int nbits = (type_bits - 3) / 2;
 //     int vbits = (max_abs > 0.0L) ? (int)std::ceil(std::log2((double)max_abs)) : 0;
 //     int shift = nbits - vbits;
 //     if (shift < 0)  shift = 0;
 //     if (shift > 62) shift = 62;
-
 //     // 3) 缩放因子（2^shift）
 //     const int64_t scale = (int64_t)1 << shift;
-
 //     // 4) 先乘后“最近整数”取整，避免近零符号丢失
 //     int64_t fp_max = std::numeric_limits<int64_t>::min();
 //     int64_t fp_min = std::numeric_limits<int64_t>::max();
 //     const long double s = (long double)scale;
-
 //     for (size_t i = 0; i < N; ++i) {
 //         long double su = (long double)U[i] * s;
 //         long double sv = (long double)V[i] * s;
 //         int64_t iu = (int64_t)std::llround(su);
 //         int64_t iv = (int64_t)std::llround(sv);
-
 //         U_fp[i] = (T_fp)iu;
 //         V_fp[i] = (T_fp)iv;
-
 //         if (iu > fp_max) fp_max = iu;
 //         if (iv > fp_max) fp_max = iv;
 //         if (iu < fp_min) fp_min = iu;
 //         if (iv < fp_min) fp_min = iv;
 //     }
-
 //     range = (T_fp)(fp_max - fp_min);
 //     return scale;
 // }
@@ -340,6 +343,159 @@ bool are_unordered_sets_equal(
     }
     return true;
 }
+
+// 统计混淆矩阵和每个时间戳的细节
+struct ConfusionCounts {
+  size_t tp = 0;
+  size_t tn = 0;
+  size_t fp = 0;
+  size_t fn = 0;
+};
+
+static inline void accumulate_confusion(ConfusionCounts& c, bool in_ori, bool in_dec) {
+  if (in_ori && in_dec)        c.tp++;
+  else if (!in_ori && !in_dec) c.tn++;
+  else if (in_dec)             c.fp++;
+  else                         c.fn++;
+}
+
+static void summarize_cp_faces_per_layer_and_slab(
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces_dec,
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces_ori,
+    int H, int W, int T,
+    const std::string& csv_path)
+{
+  if (H < 2 || W < 2 || T < 1) {
+    std::cout << "[VERIFY] CP summary skipped (invalid dimensions).\n";
+    return;
+  }
+
+  const Size3 sz{H, W, T};
+  std::vector<ConfusionCounts> layer_counts((size_t)T);
+  std::vector<ConfusionCounts> slab_counts(T > 1 ? (size_t)(T - 1) : size_t(0));
+
+  auto classify_layer = [&](int layer, const FaceKeySZ& face) {
+    const bool in_ori = cp_faces_ori.find(face) != cp_faces_ori.end();
+    const bool in_dec = cp_faces_dec.find(face) != cp_faces_dec.end();
+    accumulate_confusion(layer_counts[(size_t)layer], in_ori, in_dec);
+  };
+
+  auto classify_slab = [&](int slab, const FaceKeySZ& face) {
+    const bool in_ori = cp_faces_ori.find(face) != cp_faces_ori.end();
+    const bool in_dec = cp_faces_dec.find(face) != cp_faces_dec.end();
+    accumulate_confusion(slab_counts[(size_t)slab], in_ori, in_dec);
+  };
+
+  for (int t = 0; t < T; ++t) {
+    for (int i = 0; i < H - 1; ++i) {
+      for (int j = 0; j < W - 1; ++j) {
+        size_t v00 = vid(t, i,     j,     sz);
+        size_t v10 = vid(t, i,     j + 1, sz);
+        size_t v01 = vid(t, i + 1, j,     sz);
+        size_t v11 = vid(t, i + 1, j + 1, sz);
+
+        classify_layer(t, FaceKeySZ(v00, v01, v11));
+        classify_layer(t, FaceKeySZ(v00, v10, v11));
+      }
+    }
+  }
+
+  for (int t = 0; t < T - 1; ++t) {
+    const size_t dv = (size_t)H * (size_t)W;
+
+    for (int i = 0; i < H; ++i) {
+      for (int j = 0; j < W - 1; ++j) {
+        size_t a  = vid(t, i, j, sz);
+        size_t b  = vid(t, i, j + 1, sz);
+        size_t ap = a + dv, bp = b + dv;
+        classify_slab(t, FaceKeySZ(a, b, bp));
+        classify_slab(t, FaceKeySZ(a, bp, ap));
+      }
+    }
+
+    for (int i = 0; i < H - 1; ++i) {
+      for (int j = 0; j < W; ++j) {
+        size_t a  = vid(t, i,     j, sz);
+        size_t b  = vid(t, i + 1, j, sz);
+        size_t ap = a + dv, bp = b + dv;
+        classify_slab(t, FaceKeySZ(a, b, bp));
+        classify_slab(t, FaceKeySZ(a, bp, ap));
+      }
+    }
+
+    for (int i = 0; i < H - 1; ++i) {
+      for (int j = 0; j < W - 1; ++j) {
+        size_t ax0y0 = vid(t, i,     j,     sz);
+        size_t ax1y1 = vid(t, i + 1, j + 1, sz);
+        size_t bx0y0 = ax0y0 + dv, bx1y1 = ax1y1 + dv;
+        classify_slab(t, FaceKeySZ(ax0y0, ax1y1, bx0y0));
+        classify_slab(t, FaceKeySZ(ax1y1, bx0y0, bx1y1));
+      }
+    }
+
+    for (int i = 0; i < H - 1; ++i) {
+      for (int j = 0; j < W - 1; ++j) {
+        size_t ax0y0 = vid(t, i,     j,     sz);
+        size_t ax0y1 = vid(t, i + 1, j,     sz);
+        size_t ax1y1 = vid(t, i + 1, j + 1, sz);
+        size_t bx0y0 = ax0y0 + dv;
+        size_t bx0y1 = ax0y1 + dv;
+        size_t bx1y1 = ax1y1 + dv;
+
+        classify_slab(t, FaceKeySZ(ax0y1, bx0y0, ax1y1));
+        classify_slab(t, FaceKeySZ(ax0y1, bx0y0, bx1y1));
+
+        size_t ax1y0 = vid(t, i,     j + 1, sz);
+        size_t bx1y0 = ax1y0 + dv;
+
+        classify_slab(t, FaceKeySZ(ax0y0, ax1y1, bx1y0));
+        classify_slab(t, FaceKeySZ(ax1y1, bx0y0, bx1y0));
+      }
+    }
+  }
+
+  #if VERBOSE
+  std::cout << "[VERIFY] per-layer CP confusion (surface faces):\n";
+  for (int t = 0; t < T; ++t) {
+    const auto& c = layer_counts[(size_t)t];
+    std::cout << "  layer " << t << ": TP=" << c.tp
+              << ", TN=" << c.tn
+              << ", FP=" << c.fp
+              << ", FN=" << c.fn << "\n";
+  }
+
+  if (!slab_counts.empty()) {
+    std::cout << "[VERIFY] per-slab CP confusion (between t and t+1):\n";
+    for (int t = 0; t < T - 1; ++t) {
+      const auto& c = slab_counts[(size_t)t];
+      std::cout << "  slab " << t << "->" << (t + 1)
+                << ": TP=" << c.tp
+                << ", TN=" << c.tn
+                << ", FP=" << c.fp
+                << ", FN=" << c.fn << "\n";
+    }
+  }
+  #endif
+
+  if (!csv_path.empty()) {
+    std::ofstream ofs(csv_path);
+    if (!ofs) {
+      std::cerr << "[VERIFY] failed to open " << csv_path << " for writing.\n";
+    } else {
+      ofs << "region,index,tp,tn,fp,fn\n";
+      for (size_t idx = 0; idx < layer_counts.size(); ++idx) {
+        const auto& c = layer_counts[idx];
+        ofs << "layer," << idx << "," << c.tp << "," << c.tn << "," << c.fp << "," << c.fn << "\n";
+      }
+      for (size_t idx = 0; idx < slab_counts.size(); ++idx) {
+        const auto& c = slab_counts[idx];
+        ofs << "slab," << idx << "," << c.tp << "," << c.tn << "," << c.fp << "," << c.fn << "\n";
+      }
+    }
+    std::cout << "[VERIFY] CP confusion summary written to " << csv_path << "\n";
+  }
+}
+
 
 template<typename T_fp>
 static inline bool face_has_cp_robust(size_t a,size_t b,size_t c,
@@ -921,9 +1077,6 @@ static inline void verify(const T* U_orig, const T* V_orig,
     print_metrics("V", mv);
     print_metrics("U+V (combined)", mall);
 }
-
-// ========== 误差模式 ==========
-enum class EbMode : uint8_t { Absolute=0, Relative=1 };
 
 // ===== 主函数：逐顶点 + CP 面集合 =====
 template<typename T_data>
@@ -1583,14 +1736,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
   auto cp_faces = compute_cp_2p5d_faces<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
   auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
 
-  // === 覆盖调试：记录编码端“触达”的三角面 ===
-  #ifndef CP_DEBUG_VISIT
-  #define CP_DEBUG_VISIT 0   // 调试时开，性能敏感时关
-  #endif
-  #ifndef DEBUG_USE
-  #define DEBUG_USE 0   
-  #endif
-
 
   #if CP_DEBUG_VISIT
   // 1.1 记录：编码端枚举/检查过的三角面
@@ -1716,7 +1861,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             size_t v11 = vid(t,ci+1,cj+1,sz);
 
             // Upper: (v00,v01,v11)
-            if (v==v00 || v==v01 || v==v11){
+            if (v==v00 || v==v01 || v==v11){ //这里的 ||好像可以不需要。只保留 v==v00 就行?
               #if CP_DEBUG_VISIT
               MARK_FACE(v00,v01,v11);
               #endif
@@ -2895,44 +3040,46 @@ int main(int argc, char** argv) {
     //把dimension当作filename转换成string
     std::string dim_str = std::to_string(dim_W) + "x" + std::to_string(dim_H) + "x" + std::to_string(dim_T);
 
-    auto* compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
-    U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T, // 450,150,2001
-    compressed_size, error_bound,mode);
+    // auto* compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
+    // U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T, // 450,150,2001
+    // compressed_size, error_bound,mode);
 
-    if (!compressed){
-        std::cerr << "[ERR] compression returned null.\n";
-        return 2;
-    }
-    // exit(0);
-    unsigned char * result_after_lossless = NULL;
-    size_t lossless_outsize = sz_lossless_compress(ZSTD_COMPRESSOR, 3, compressed, compressed_size, &result_after_lossless);
-    //释放返回的缓冲区（由函数 malloc 分配）
-    std::free(compressed);
-    auto end_t = std::chrono::high_resolution_clock::now();
-    cout << "compression time in sec:" << std::chrono::duration<double>(end_t - start_t).count() << endl;
-    cout << "compressed size (after lossless): " << lossless_outsize << " bytes." << "ratio = " << (2*num_elements*sizeof(float))/double(lossless_outsize) << endl;
+    // if (!compressed){
+    //     std::cerr << "[ERR] compression returned null.\n";
+    //     return 2;
+    // }
+    // // exit(0);
+    // unsigned char * result_after_lossless = NULL;
+    // size_t lossless_outsize = sz_lossless_compress(ZSTD_COMPRESSOR, 3, compressed, compressed_size, &result_after_lossless);
+    // //释放返回的缓冲区（由函数 malloc 分配）
+    // std::free(compressed);
+    // auto end_t = std::chrono::high_resolution_clock::now();
+    // cout << "compression time in sec:" << std::chrono::duration<double>(end_t - start_t).count() << endl;
+    // cout << "compressed size (after lossless): " << lossless_outsize << " bytes." << "ratio = " << (2*num_elements*sizeof(float))/double(lossless_outsize) << endl;
     
-    //调用解压
-    auto dec_start_t = std::chrono::high_resolution_clock::now();
-    unsigned char * decompressed = NULL;
-    size_t decompressed_size = sz_lossless_decompress(ZSTD_COMPRESSOR,result_after_lossless, lossless_outsize, &decompressed,compressed_size);
-    //释放返回的缓冲区（由函数 malloc 分配）
-    std::free(result_after_lossless);
-    if (!decompressed){
-        std::cerr << "[ERR] lossless decompression returned null.\n";
-        return 3;
-    }
-    //调用sz_decompress_cp_preserve_sos_2p5d_online_fp
-    float * U_dec = NULL;
-    float * V_dec = NULL;
+    // //调用解压
+    // auto dec_start_t = std::chrono::high_resolution_clock::now();
+    // unsigned char * decompressed = NULL;
+    // size_t decompressed_size = sz_lossless_decompress(ZSTD_COMPRESSOR,result_after_lossless, lossless_outsize, &decompressed,compressed_size);
+    // //释放返回的缓冲区（由函数 malloc 分配）
+    // std::free(result_after_lossless);
+    // if (!decompressed){
+    //     std::cerr << "[ERR] lossless decompression returned null.\n";
+    //     return 3;
+    // }
+    // //调用sz_decompress_cp_preserve_sos_2p5d_online_fp
+    // float * U_dec = NULL;
+    // float * V_dec = NULL;
     int H = dim_H; //450;
     int W = dim_W; //150;
     int T = dim_T; //2001;
-    printf("start decompression...\n");
-    sz_decompress_cp_preserve_sos_2p5d_fp<float>(decompressed, H, W, T, U_dec, V_dec);
-    auto dec_end_t = std::chrono::high_resolution_clock::now();
-    cout << "decompression time in sec:" << std::chrono::duration<double>(dec_end_t - dec_start_t).count() << endl;
+    // printf("start decompression...\n");
+    // sz_decompress_cp_preserve_sos_2p5d_fp<float>(decompressed, H, W, T, U_dec, V_dec);
+    // auto dec_end_t = std::chrono::high_resolution_clock::now();
+    // cout << "decompression time in sec:" << std::chrono::duration<double>(dec_end_t - dec_start_t).count() << endl;
 
+
+    #if VERIFY
     //verify
     printf("start verify....\n");
     float * U_ori = readfile<float>(u_path.c_str(),num_elements);
@@ -2960,16 +3107,200 @@ int main(int argc, char** argv) {
     if (!cp_equal) {
         print_cp_face_diffs(cp_faces_dec, cp_faces_ori, U_dec, V_dec, U_ori, V_ori,U_dec_fp, V_dec_fp, U_ori_fp, V_ori_fp, H, W, T);
     }
-    exit(0);
 
-    // printf("calculating cp_count for decompressed data...\n");
-    // const Size3 sz{ (int)H,(int)W,(int)T };
-    // int64_t* U_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    // int64_t* V_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    // int64_t range=0, scale=convert_to_fixed_point<float,int64_t>(U_dec,V_dec,num_elements,U_fp,V_fp,range);
-    // std::vector<int64_t> eb_min(num_elements, 0.01);
-    // accumulate_eb_min_global_unique_with_internal(sz, U_fp, V_fp, eb_min);
+    #if DETAIL
+      const std::string csv_name =
+      std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + ".csv";
+      summarize_cp_faces_per_layer_and_slab(cp_faces_dec, cp_faces_ori, H, W, T, csv_name);
+    #endif
 
+
+
+    std::free(U_ori);
+    std::free(V_ori);
+    std::free(U_ori_fp);
+    std::free(V_ori_fp);
+    std::free(U_dec_fp);
+    std::free(V_dec_fp);
+    #endif
+
+    #if CPSZ_BASELINE
+    float *U_dec_cpsz = nullptr;
+    float *V_dec_cpsz = nullptr;
+    int64_t *U_dec_cpsz_fp = nullptr;
+    int64_t *V_dec_cpsz_fp = nullptr;
+    int64_t *U_ori_cpsz_fp = nullptr;
+    int64_t *V_ori_cpsz_fp = nullptr;
+
+    const size_t frame_elems = dim_H * dim_W;
+    const size_t total_elems = frame_elems * dim_T;
+    int64_t global_scalar_cpsz = 0;
+    int64_t global_range_cpsz = 0;
+
+    if (total_elems != num_elements) {
+        std::cerr << "[ERR] CPSZ baseline skipped: element count mismatch (dims="
+                  << total_elems << ", file=" << num_elements << ")." << std::endl;
+    } else {
+        double cpsz_max_pwr_eb = error_bound;
+        if (mode == EbMode::Relative) {
+            // relative mode expects a ratio; keep the user-specified error_bound as-is
+        } else if (mode != EbMode::Absolute) {
+            std::cerr << "[ERR] Unsupported error mode for CPSZ baseline." << std::endl;
+        }
+
+        size_t cpsz_compressed_size = 0;
+        const auto cpsz_2d_comp_time_start = std::chrono::high_resolution_clock::now();
+        unsigned char *cpsz_compressed = sz_compress_cp_preserve_sos_2d_time_online_fp(
+            U_ptr,
+            V_ptr,
+            dim_T,
+            dim_H,
+            dim_W,
+            cpsz_compressed_size,
+            /*transpose=*/false,
+            cpsz_max_pwr_eb,
+            mode);
+        const auto cpsz_2d_comp_time_end = std::chrono::high_resolution_clock::now();
+        std::cout << "CPSZ 2D-time compression time in sec: "
+                  << std::chrono::duration<double>(cpsz_2d_comp_time_end - cpsz_2d_comp_time_start).count() << std::endl;
+        std::cout << "CPSZ compressed size: " << cpsz_compressed_size
+                  << " bytes. ratio = " << (2 * total_elems * sizeof(float)) / double(cpsz_compressed_size) << std::endl;
+
+        bool parsed_global_params = false;
+        if (cpsz_compressed && cpsz_compressed_size >= sizeof(size_t) * 4 + sizeof(int64_t) * 2) {
+            size_t cursor = 0;
+            auto read_size_t = [&](size_t &value) -> bool {
+                if (cursor + sizeof(size_t) > cpsz_compressed_size) return false;
+                std::memcpy(&value, cpsz_compressed + cursor, sizeof(size_t));
+                cursor += sizeof(size_t);
+                return true;
+            };
+            auto read_int64 = [&](int64_t &value) -> bool {
+                if (cursor + sizeof(int64_t) > cpsz_compressed_size) return false;
+                std::memcpy(&value, cpsz_compressed + cursor, sizeof(int64_t));
+                cursor += sizeof(int64_t);
+                return true;
+            };
+
+            size_t header_time = 0;
+            size_t header_r2 = 0;
+            size_t header_r3 = 0;
+            parsed_global_params = read_size_t(header_time) && read_size_t(header_r2) && read_size_t(header_r3);
+            if (parsed_global_params && header_time > 0) {
+                size_t first_frame_size = 0;
+                parsed_global_params = read_size_t(first_frame_size) && read_int64(global_scalar_cpsz) && read_int64(global_range_cpsz);
+            } else {
+                parsed_global_params = false;
+            }
+        }
+
+        if (!cpsz_compressed) {
+            std::cerr << "[ERR] CPSZ compression failed." << std::endl;
+        } else {
+            size_t dec_time_dim = 0;
+            size_t dec_H = 0;
+            size_t dec_W = 0;
+            const auto cpsz_2d_decomp_time_start = std::chrono::high_resolution_clock::now();
+            sz_decompress_cp_preserve_2d_time_online_fp<float>(
+                cpsz_compressed,
+                dec_time_dim,
+                dec_H,
+                dec_W,
+                U_dec_cpsz,
+                V_dec_cpsz);
+            const auto cpsz_2d_decomp_time_end = std::chrono::high_resolution_clock::now();
+            std::cout << "CPSZ 2D-time decompression time in sec: "
+                      << std::chrono::duration<double>(cpsz_2d_decomp_time_end - cpsz_2d_decomp_time_start).count() << std::endl;
+            std::free(cpsz_compressed);
+
+            if (!U_dec_cpsz || !V_dec_cpsz) {
+                std::cerr << "[ERR] CPSZ decompression returned null buffers." << std::endl;
+            } else if (dec_time_dim != dim_T || dec_H != dim_H || dec_W != dim_W) {
+                std::cerr << "[ERR] CPSZ decompression dimension mismatch: "
+                          << "time=" << dec_time_dim << " (expected " << dim_T << ") "
+                          << "H=" << dec_H << " (expected " << dim_H << ") "
+                          << "W=" << dec_W << " (expected " << dim_W << ")." << std::endl;
+            } else {
+                if ((!parsed_global_params || global_scalar_cpsz <= 0) && total_elems > 0) {
+                    std::vector<int64_t> tmp_u(total_elems);
+                    std::vector<int64_t> tmp_v(total_elems);
+                    int64_t tmp_range = 0;
+                    global_scalar_cpsz = convert_to_fixed_point<float, int64_t>(
+                        U_ptr,
+                        V_ptr,
+                        total_elems,
+                        tmp_u.data(),
+                        tmp_v.data(),
+                        tmp_range);
+                    global_range_cpsz = tmp_range;
+                    parsed_global_params = (global_scalar_cpsz > 0);
+                }
+
+                if (global_scalar_cpsz <= 0) {
+                    global_scalar_cpsz = 1;
+                }
+
+                U_dec_cpsz_fp = static_cast<int64_t *>(std::malloc(total_elems * sizeof(int64_t)));
+                V_dec_cpsz_fp = static_cast<int64_t *>(std::malloc(total_elems * sizeof(int64_t)));
+                U_ori_cpsz_fp = static_cast<int64_t *>(std::malloc(total_elems * sizeof(int64_t)));
+                V_ori_cpsz_fp = static_cast<int64_t *>(std::malloc(total_elems * sizeof(int64_t)));
+                if (!U_dec_cpsz_fp || !V_dec_cpsz_fp || !U_ori_cpsz_fp || !V_ori_cpsz_fp) {
+                    std::cerr << "[ERR] CPSZ fixed-point buffer allocation failed." << std::endl;
+                    std::free(U_dec_cpsz_fp); U_dec_cpsz_fp = nullptr;
+                    std::free(V_dec_cpsz_fp); V_dec_cpsz_fp = nullptr;
+                    std::free(U_ori_cpsz_fp); U_ori_cpsz_fp = nullptr;
+                    std::free(V_ori_cpsz_fp); V_ori_cpsz_fp = nullptr;
+                } else {
+                    convert_to_fixed_point_given_factor(
+                        U_dec_cpsz,
+                        V_dec_cpsz,
+                        total_elems,
+                        U_dec_cpsz_fp,
+                        V_dec_cpsz_fp,
+                        global_scalar_cpsz);
+                    convert_to_fixed_point_given_factor(
+                        U_ptr,
+                        V_ptr,
+                        total_elems,
+                        U_ori_cpsz_fp,
+                        V_ori_cpsz_fp,
+                        global_scalar_cpsz);
+                }
+            }
+        }
+    }
+
+    if (U_dec_cpsz_fp && V_dec_cpsz_fp && U_ori_cpsz_fp && V_ori_cpsz_fp) {
+        auto cp_faces_cpsz = compute_cp_2p5d_faces(U_dec_cpsz_fp, V_dec_cpsz_fp, H, W, T);
+        std::cout << "Total faces with CP dec CPSZ baseline: " << cp_faces_cpsz.size() << std::endl;
+
+        auto cp_faces_ori_cpsz = compute_cp_2p5d_faces(U_ori_cpsz_fp, V_ori_cpsz_fp, H, W, T);
+        const std::string csv_name_cpsz =
+            std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + "_" + std::to_string(error_bound) + "_cpsz.csv";
+        summarize_cp_faces_per_layer_and_slab(cp_faces_cpsz, cp_faces_ori_cpsz, H, W, T, csv_name_cpsz);
+        std::cout << "CPSZ baseline summary written to " << csv_name_cpsz << std::endl;
+    }
+
+    if (U_dec_cpsz && V_dec_cpsz) {
+        printf("start verify CPSZ baseline....\n");
+        verify(U_ptr, V_ptr, U_dec_cpsz, V_dec_cpsz, H, W, T);
+    }
+
+    std::free(U_dec_cpsz);
+    std::free(V_dec_cpsz);
+    std::free(U_dec_cpsz_fp);
+    std::free(V_dec_cpsz_fp);
+    std::free(U_ori_cpsz_fp);
+    std::free(V_ori_cpsz_fp);
+
+#endif
+    
+    //释放返回的缓冲区（由函数 malloc 分配）
+    // std::free(decompressed);
+    // std::free(U_ptr);
+    // std::free(V_ptr);
+    // std::free(U_dec);
+    // std::free(V_dec);
 
     return 0;
 }

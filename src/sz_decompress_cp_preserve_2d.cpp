@@ -190,9 +190,11 @@ sz_decompress_cp_preserve_2d_online_fp(const unsigned char * compressed, size_t 
 	const unsigned char * compressed_pos = compressed;
 	T vector_field_scaling_factor = 0;
 	read_variable_from_src(compressed_pos, vector_field_scaling_factor);
+	T range = 0;
+	read_variable_from_src(compressed_pos, range);
 	int base = 0;
 	read_variable_from_src(compressed_pos, base);
-	printf("base = %d\n", base);
+	//printf("base = %d\n", base);
 	T threshold = 0;
 	read_variable_from_src(compressed_pos, threshold);
 	int intv_radius = 0;
@@ -209,7 +211,7 @@ sz_decompress_cp_preserve_2d_online_fp(const unsigned char * compressed, size_t 
 	size_t data_quant_num = 0;
 	read_variable_from_src(compressed_pos, data_quant_num);
 	int * data_quant_index = Huffman_decode_tree_and_data(2*capacity, data_quant_num, compressed_pos);
-	printf("pos = %ld\n", compressed_pos - compressed);
+	//printf("pos = %ld\n", compressed_pos - compressed);
 	T * U_fp = (T *) malloc(num_elements*sizeof(T));
 	T * V_fp = (T *) malloc(num_elements*sizeof(T));
 	T * U_pos = U_fp;
@@ -352,3 +354,65 @@ sz_decompress_cp_preserve_2d_online_log<float>(const unsigned char * compressed,
 template
 void
 sz_decompress_cp_preserve_2d_online_log<double>(const unsigned char * compressed, size_t r1, size_t r2, double *& U, double *& V);
+
+
+template<typename T_data>
+void
+sz_decompress_cp_preserve_2d_time_online_fp(const unsigned char * compressed, size_t& r1_time_dim, size_t& r2, size_t& r3, T_data *& U, T_data *& V){
+	if(U) free(U);
+	if(V) free(V);
+	const unsigned char * compressed_pos = compressed;
+	size_t time_dim = 0;
+	read_variable_from_src(compressed_pos, time_dim);
+	size_t dim_r2 = 0;
+	read_variable_from_src(compressed_pos, dim_r2);
+	size_t dim_r3 = 0;
+	read_variable_from_src(compressed_pos, dim_r3);
+	std::vector<const unsigned char *> frame_ptrs;
+	frame_ptrs.reserve(time_dim);
+	for(size_t t = 0; t < time_dim; t++){
+		size_t frame_size = 0;
+		read_variable_from_src(compressed_pos, frame_size);
+		frame_ptrs.push_back(compressed_pos);
+		compressed_pos += frame_size;
+	}
+	size_t frame_element_count = dim_r2 * dim_r3;
+	size_t total_elements = time_dim * frame_element_count;
+	if(total_elements == 0){
+		r1_time_dim = time_dim;
+		r2 = dim_r2;
+		r3 = dim_r3;
+		U = nullptr;
+		V = nullptr;
+		return;
+	}
+	U = (T_data *) malloc(total_elements * sizeof(T_data));
+	V = (T_data *) malloc(total_elements * sizeof(T_data));
+	T_data * cur_U = U;
+	T_data * cur_V = V;
+	for(size_t t = 0; t < time_dim; t++){
+		T_data * frame_U = nullptr;
+		T_data * frame_V = nullptr;
+		sz_decompress_cp_preserve_2d_online_fp(frame_ptrs[t], dim_r2, dim_r3, frame_U, frame_V);
+		for(size_t idx = 0; idx < frame_element_count; idx++){
+			cur_U[idx] = frame_U[idx];
+			cur_V[idx] = frame_V[idx];
+		}
+		free(frame_U);
+		free(frame_V);
+		cur_U += frame_element_count;
+		cur_V += frame_element_count;
+	}
+	r1_time_dim = time_dim;
+	r2 = dim_r2;
+	r3 = dim_r3;
+}
+
+
+template
+void
+sz_decompress_cp_preserve_2d_time_online_fp(const unsigned char * compressed, size_t& r1_time_dim, size_t& r2, size_t& r3, float *& U, float *& V);
+
+template
+void
+sz_decompress_cp_preserve_2d_time_online_fp(const unsigned char * compressed, size_t& r1_time_dim, size_t& r2, size_t& r3, double *& U, double *& V);

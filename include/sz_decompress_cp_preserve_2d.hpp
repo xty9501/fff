@@ -26,4 +26,9 @@ template<typename T>
 void
 sz_decompress_cp_preserve_2d_online_log(const unsigned char * compressed, size_t r1, size_t r2, T *& U, T *& V);
 
+
+template<typename T>
+void
+sz_decompress_cp_preserve_2d_time_online_fp(const unsigned char * compressed, size_t& r1, size_t& r2, size_t& r3, T *& U, T *& V);
+
 #endif

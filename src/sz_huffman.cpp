@@ -206,6 +206,10 @@ void init(HuffmanTree* huffmanTree, const int *s, size_t length)
 	for (i = 0; i < huffmanTree->allNodes; i++)
 		if (freq[i]) 
 			qinsert(huffmanTree, new_node(huffmanTree, freq[i], i, 0, 0));
+	if (huffmanTree->qend <= 1) {
+		/* ensure a valid root even when length==0 */
+		qinsert(huffmanTree, new_node(huffmanTree, 1, 0, 0, 0));
+	}
  
 	while (huffmanTree->qend > 2) 
 		qinsert(huffmanTree, new_node(huffmanTree, 0, 0, qremove(huffmanTree), qremove(huffmanTree)));
