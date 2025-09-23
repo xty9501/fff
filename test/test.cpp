@@ -1,9 +1,11 @@
 #define CP_DEBUG_VISIT 0
 #define DEBUG_USE 0
 #define VERBOSE 0
-#define VERIFY 0 //验证
+#define VERIFY 1 //验证
 #define DETAIL 0 //详细
 #define CPSZ_BASELINE 1 //baseline results for cpsz
+#define STREAMING 1 //streaming mode
+#define VISUALIZE 0 //visualization mode
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -19,6 +21,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <functional>
+#include <utility>
 #include <ftk/numeric/critical_point_type.hh>
 #include <ftk/numeric/critical_point_test.hh>
 #include <ftk/numeric/inverse_linear_interpolation_solver.hh>
@@ -1241,7 +1244,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             size_t v11 = vid(t,ci+1,cj+1,sz);
 
             // Upper: (v00,v01,v11)
-            if (v==v00 || v==v01 || v==v11){ //这里的 ||好像可以不需要。只保留 v==v00 就行?
+            if (v==v00 || v==v01 || v==v11){ 
               #if CP_DEBUG_VISIT
               MARK_FACE(v00,v01,v11);
               #endif
@@ -1812,6 +1815,824 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
 }
 
 
+template<typename T_data, typename LayerFetcher>
+static unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
+    LayerFetcher&& fetch_layer,
+    size_t r1, size_t r2, size_t r3,
+    size_t& compressed_size,
+    double max_pwr_eb,
+    EbMode mode)
+{
+  using T = int64_t;
+  const size_t H = r1, W = r2, Tt = r3;
+  if (!H || !W || !Tt) {
+    compressed_size = 0;
+    return nullptr;
+  }
+
+  const Size3 sz{(int)H, (int)W, (int)Tt};
+  const size_t layer_size = H * W;
+
+  std::vector<T_data> tmpU(layer_size);
+  std::vector<T_data> tmpV(layer_size);
+
+  // -------- Pass 1: determine scaling factor --------
+  double vector_field_resolution = 0.0;
+  for (size_t t = 0; t < Tt; ++t) {
+    if (!fetch_layer(t, tmpU.data(), tmpV.data())) {
+      compressed_size = 0;
+      return nullptr;
+    }
+    for (size_t idx = 0; idx < layer_size; ++idx) {
+      double max_val = std::max(std::fabs((double)tmpU[idx]), std::fabs((double)tmpV[idx]));
+      if (max_val > vector_field_resolution) vector_field_resolution = max_val;
+    }
+  }
+
+  const int type_bits = 63;
+  const int nbits = (type_bits - 3) / 2;
+  int vbits = 0;
+  if (vector_field_resolution > 0.0) {
+    vbits = (int)std::ceil(std::log2(vector_field_resolution));
+  }
+  int shift_bits = nbits - vbits;
+  if (shift_bits < 0) shift_bits = 0;
+  T scale = (T)1 << shift_bits;
+
+  std::cerr << "resolution=" << vector_field_resolution
+            << ", factor=" << (long long)scale
+            << ", nbits=" << nbits
+            << ", vbits=" << vbits
+            << ", shift_bits=" << shift_bits << std::endl;
+
+  T fp_max = std::numeric_limits<T>::min();
+  T fp_min = std::numeric_limits<T>::max();
+  printf("max = %lld, min = %lld\n", (long long)fp_max, (long long)fp_min);
+
+  auto load_layer_fixed = [&](size_t t,
+                              std::vector<T>& outU,
+                              std::vector<T>& outV,
+                              std::vector<T_data>* storeU,
+                              std::vector<T_data>* storeV,
+                              bool update_minmax)->bool {
+    if (!fetch_layer(t, tmpU.data(), tmpV.data())) {
+      return false;
+    }
+    for (size_t idx = 0; idx < layer_size; ++idx) {
+      T u_fp = static_cast<T>(tmpU[idx] * (double)scale);
+      T v_fp = static_cast<T>(tmpV[idx] * (double)scale);
+      outU[idx] = u_fp;
+      outV[idx] = v_fp;
+      if (storeU) (*storeU)[idx] = tmpU[idx];
+      if (storeV) (*storeV)[idx] = tmpV[idx];
+      if (update_minmax) {
+        if (u_fp > fp_max) fp_max = u_fp;
+        if (v_fp > fp_max) fp_max = v_fp;
+        if (u_fp < fp_min) fp_min = u_fp;
+        if (v_fp < fp_min) fp_min = v_fp;
+      }
+    }
+    return true;
+  };
+
+  auto pre_compute_time = std::chrono::high_resolution_clock::now();
+
+  std::vector<T> u_prev(layer_size, 0), v_prev(layer_size, 0);
+  std::vector<T> u_curr(layer_size, 0), v_curr(layer_size, 0);
+  std::vector<T> u_next(layer_size, 0), v_next(layer_size, 0);
+
+  if (!load_layer_fixed(0, u_curr, v_curr, nullptr, nullptr, true)) {
+    compressed_size = 0;
+    return nullptr;
+  }
+  if (Tt > 1) {
+    if (!load_layer_fixed(1, u_next, v_next, nullptr, nullptr, true)) {
+      compressed_size = 0;
+      return nullptr;
+    }
+  }
+
+  std::unordered_set<FaceKeySZ, FaceKeySZHash> cp_faces;
+  cp_faces.reserve((size_t)(H*(size_t)W*(size_t)Tt / 8));
+
+  auto eval_face = [&](size_t t_base,
+                       size_t a,size_t b,size_t c)->bool {
+    int idxs[3] = { (int)a, (int)b, (int)c };
+    int64_t vf[3][2];
+    auto fetch_value = [&](size_t vidx, int pos){
+      int vt, vi, vj;
+      inv_vid(vidx, (int)H, (int)W, vt, vi, vj);
+      size_t off = (size_t)vi * W + (size_t)vj;
+      const std::vector<T>* su = nullptr;
+      const std::vector<T>* sv = nullptr;
+      if (vt == (int)t_base) {
+        su = &u_curr; sv = &v_curr;
+      } else if (vt == (int)t_base + 1) {
+        su = &u_next; sv = &v_next;
+      } else if (vt == (int)t_base - 1) {
+        su = &u_prev; sv = &v_prev;
+      } else {
+        su = &u_curr; sv = &v_curr;
+      }
+      vf[pos][0] = (*su)[off];
+      vf[pos][1] = (*sv)[off];
+    };
+    fetch_value(a, 0);
+    fetch_value(b, 1);
+    fetch_value(c, 2);
+    return ftk::robust_critical_point_in_simplex2(vf, idxs);
+  };
+
+  const size_t dv = H * W;
+
+  for (size_t t = 0; t < Tt; ++t) {
+    if (t % 1000 == 0) {
+      printf("pre-compute cp lower layer %zu / %zu\n", t, Tt);
+    }
+    // (1) 同层面
+    for (size_t i = 0; i + 1 < H; ++i) {
+      for (size_t j = 0; j + 1 < W; ++j) {
+        size_t v00 = vid((int)t,(int)i,(int)j,sz);
+        size_t v10 = vid((int)t,(int)i,(int)(j+1),sz);
+        size_t v01 = vid((int)t,(int)(i+1),(int)j,sz);
+        size_t v11 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+        if (eval_face(t, v00, v01, v11)) {
+          cp_faces.emplace(v00, v01, v11);
+        }
+        if (eval_face(t, v00, v10, v11)) {
+          cp_faces.emplace(v00, v10, v11);
+        }
+      }
+    }
+
+    if (t + 1 < Tt) {
+      if (t % 1000 == 0) {
+        printf("pre-compute cp side_hor layer %zu / %zu\n", t, Tt);
+      }
+      for (size_t i = 0; i < H; ++i) {
+        for (size_t j = 0; j + 1 < W; ++j) {
+          size_t a = vid((int)t,(int)i,(int)j,sz);
+          size_t b = vid((int)t,(int)i,(int)(j+1),sz);
+          size_t ap = a + dv;
+          size_t bp = b + dv;
+          if (eval_face(t, a, b, bp)) cp_faces.emplace(a, b, bp);
+          if (eval_face(t, a, bp, ap)) cp_faces.emplace(a, bp, ap);
+        }
+      }
+
+      if (t % 1000 == 0) {
+        printf("pre-compute cp side_ver layer %zu / %zu\n", t, Tt);
+      }
+      for (size_t i = 0; i + 1 < H; ++i) {
+        for (size_t j = 0; j < W; ++j) {
+          size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+          size_t ax0y1 = vid((int)t,(int)(i+1),(int)j,sz);
+          size_t bx0y0 = ax0y0 + dv;
+          size_t bx0y1 = ax0y1 + dv;
+          if (eval_face(t, ax0y0, ax0y1, bx0y0)) cp_faces.emplace(ax0y0, ax0y1, bx0y0);
+          if (eval_face(t, ax0y1, bx0y0, bx0y1)) cp_faces.emplace(ax0y1, bx0y0, bx0y1);
+        }
+      }
+
+      if (t % 1000 == 0) {
+        printf("pre-compute cp diag layer %zu / %zu\n", t, Tt);
+      }
+      for (size_t i = 0; i + 1 < H; ++i) {
+        for (size_t j = 0; j + 1 < W; ++j) {
+          size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+          size_t ax1y1 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+          size_t bx0y0 = ax0y0 + dv;
+          size_t bx1y1 = ax1y1 + dv;
+          if (eval_face(t, ax0y0, ax1y1, bx0y0)) cp_faces.emplace(ax0y0, ax1y1, bx0y0);
+          if (eval_face(t, ax1y1, bx0y0, bx1y1)) cp_faces.emplace(ax1y1, bx0y0, bx1y1);
+        }
+      }
+
+      if (t % 1000 == 0) {
+        printf("pre-compute cp inside layer %zu / %zu\n", t, Tt);
+      }
+      for (size_t i = 0; i + 1 < H; ++i) {
+        for (size_t j = 0; j + 1 < W; ++j) {
+          size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+          size_t ax0y1 = vid((int)t,(int)(i+1),(int)j,sz);
+          size_t ax1y1 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+          size_t ax1y0 = vid((int)t,(int)i,(int)(j+1),sz);
+          size_t bx0y0 = ax0y0 + dv;
+          size_t bx0y1 = ax0y1 + dv;
+          size_t bx1y1 = ax1y1 + dv;
+          size_t bx1y0 = ax1y0 + dv;
+
+          if (eval_face(t, ax0y1, bx0y0, ax1y1)) cp_faces.emplace(ax0y1, bx0y0, ax1y1);
+          if (eval_face(t, ax0y1, bx0y0, bx1y1)) cp_faces.emplace(ax0y1, bx0y0, bx1y1);
+          if (eval_face(t, ax0y0, ax1y1, bx1y0)) cp_faces.emplace(ax0y0, ax1y1, bx1y0);
+          if (eval_face(t, ax1y1, bx0y0, bx1y0)) cp_faces.emplace(ax1y1, bx0y0, bx1y0);
+        }
+      }
+    }
+
+    // rotate buffers
+    if (t + 1 < Tt) {
+      u_prev.swap(u_curr);
+      v_prev.swap(v_curr);
+      u_curr.swap(u_next);
+      v_curr.swap(v_next);
+      if (t + 2 < Tt) {
+        if (!load_layer_fixed(t + 2, u_next, v_next, nullptr, nullptr, true)) {
+          compressed_size = 0;
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  printf("max = %lld, min = %lld\n", (long long)fp_max, (long long)fp_min);
+  const T range = fp_max - fp_min;
+
+  auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
+  std::cout << "pre-compute cp faces time second: "
+            << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
+            << std::endl;
+  std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
+  // -------- Pass 3: quantization in streaming manner --------
+  int* eb_quant_index  = (int*)std::malloc((size_t)(H*W*Tt) * sizeof(int));
+  int* data_quant_index= (int*)std::malloc((size_t)(2*H*W*Tt) * sizeof(int));
+  if (!eb_quant_index || !data_quant_index) {
+    if (eb_quant_index) std::free(eb_quant_index);
+    if (data_quant_index) std::free(data_quant_index);
+    compressed_size = 0;
+    return nullptr;
+  }
+  int* eb_pos = eb_quant_index;
+  int* dq_pos = data_quant_index;
+  std::vector<T_data> unpred;
+  unpred.reserve((H*W*Tt/10)*2);
+
+  double enc_max_abs_eb_fp   = 0.0;
+  double enc_max_real_err_fp = 0.0;
+
+  const int base = 2;
+  const int capacity = 65536;
+  const double log_of_base = std::log2(base);
+  const int intv_radius = (capacity >> 1);
+
+  T max_eb = 0;
+  if (mode == EbMode::Relative) {
+    printf("Compression Using Relative Eb Mode!\n");
+    max_eb = (T)(max_pwr_eb * (double)range);
+  } else if (mode == EbMode::Absolute) {
+    printf("Compression Using Absolute Eb Mode!\n");
+    max_eb = (T)(max_pwr_eb * (double)scale);
+  } else {
+    std::cerr << "Error: Unsupported EbMode!\n";
+    std::free(eb_quant_index);
+    std::free(data_quant_index);
+    compressed_size = 0;
+    return nullptr;
+  }
+  const T threshold = 1;
+
+  std::vector<T> dec_prev_u(layer_size, 0), dec_prev_v(layer_size, 0);
+  std::vector<T> dec_curr_u(layer_size, 0), dec_curr_v(layer_size, 0);
+
+  std::vector<T_data> float_prev_u(layer_size, (T_data)0);
+  std::vector<T_data> float_prev_v(layer_size, (T_data)0);
+  std::vector<T_data> float_curr_u(layer_size, (T_data)0);
+  std::vector<T_data> float_curr_v(layer_size, (T_data)0);
+  std::vector<T_data> float_next_u(layer_size, (T_data)0);
+  std::vector<T_data> float_next_v(layer_size, (T_data)0);
+
+  std::fill(u_prev.begin(), u_prev.end(), 0);
+  std::fill(v_prev.begin(), v_prev.end(), 0);
+
+  if (!load_layer_fixed(0, u_curr, v_curr, &float_curr_u, &float_curr_v, false)) {
+    std::free(eb_quant_index);
+    std::free(data_quant_index);
+    compressed_size = 0;
+    return nullptr;
+  }
+  bool have_next_layer = false;
+  if (Tt > 1) {
+    if (!load_layer_fixed(1, u_next, v_next, &float_next_u, &float_next_v, false)) {
+      std::free(eb_quant_index);
+      std::free(data_quant_index);
+      compressed_size = 0;
+      return nullptr;
+    }
+    have_next_layer = true;
+  }
+
+  const int di[6] = { 0,  0,  1, -1,  1, -1 };
+  const int dj[6] = { 1, -1,  0,  0,  1, -1 };
+
+  auto fetch_fixed_pair = [&](size_t t_base, size_t vidx)->std::pair<T,T> {
+    int vt, vi, vj;
+    inv_vid(vidx, (int)H, (int)W, vt, vi, vj);
+    size_t off = (size_t)vi * W + (size_t)vj;
+    if (vt == (int)t_base) {
+      return { u_curr[off], v_curr[off] };
+    } else if (vt == (int)t_base + 1) {
+      return { u_next[off], v_next[off] };
+    } else if (vt == (int)t_base - 1) {
+      return { u_prev[off], v_prev[off] };
+    }
+    return { u_curr[off], v_curr[off] };
+  };
+
+  auto fetch_prev_dec = [&](size_t off)->std::pair<T,T> {
+    return { dec_prev_u[off], dec_prev_v[off] };
+  };
+
+  auto fetch_curr_dec = [&](size_t off)->std::pair<T,T> {
+    return { dec_curr_u[off], dec_curr_v[off] };
+  };
+
+  for (size_t t = 0; t < Tt; ++t) {
+    if (t % 100 == 0) {
+      printf("processing slice %zu / %zu\n", t, Tt);
+    }
+    for (size_t i = 0; i < H; ++i) {
+      for (size_t j = 0; j < W; ++j) {
+        size_t global_idx = vid((int)t,(int)i,(int)j,sz);
+        size_t off = i * W + j;
+
+        const T curU_val = u_curr[off];
+        const T curV_val = v_curr[off];
+
+        T required_eb = max_eb;
+
+        // (A) 同层
+        for (int ci = (int)i - 1; ci <= (int)i; ++ci) {
+          if (!in_range(ci, (int)H - 1)) continue;
+          for (int cj = (int)j - 1; cj <= (int)j; ++cj) {
+            if (!in_range(cj, (int)W - 1)) continue;
+            size_t v00 = vid((int)t, ci,   cj,   sz);
+            size_t v10 = vid((int)t, ci,   cj+1, sz);
+            size_t v01 = vid((int)t, ci+1, cj,   sz);
+            size_t v11 = vid((int)t, ci+1, cj+1, sz);
+
+            auto u01 = fetch_fixed_pair(t, v01);
+            auto u11 = fetch_fixed_pair(t, v11);
+            auto u10 = fetch_fixed_pair(t, v10);
+            auto u00 = fetch_fixed_pair(t, v00);
+
+            if (global_idx == v00 || global_idx == v01 || global_idx == v11) {
+              if (has_cp(cp_faces, v00, v01, v11)) required_eb = 0;
+              T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u01.first, u00.first,
+                                                    u11.second, u01.second, u00.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+            if (global_idx == v00 || global_idx == v10 || global_idx == v11) {
+              if (has_cp(cp_faces, v00, v10, v11)) required_eb = 0;
+              T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u10.first, u00.first,
+                                                    u11.second, u10.second, u00.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        // (B1) 侧面 [t, t+1]
+        if (t + 1 < Tt) {
+          for (int k = 0; k < 6; ++k) {
+            int ni = (int)i + di[k];
+            int nj = (int)j + dj[k];
+            if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
+            size_t a = vid((int)t, (int)i, (int)j, sz);
+            size_t b = vid((int)t, ni, nj, sz);
+            size_t ap = a + dv;
+            size_t bp = b + dv;
+            auto val_a  = fetch_fixed_pair(t, a);
+            auto val_b  = fetch_fixed_pair(t, b);
+            auto val_ap = fetch_fixed_pair(t, ap);
+            auto val_bp = fetch_fixed_pair(t, bp);
+
+            if (k == 0 || k == 3 || k == 5) {
+              if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
+                                                      val_bp.second, val_b.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+              if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
+                                                      val_ap.second, val_bp.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+            } else {
+              if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
+                                                      val_ap.second, val_b.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+            }
+          }
+        }
+
+        // (B2) 侧面 [t-1, t]
+        if (t > 0) {
+          for (int k = 0; k < 6; ++k) {
+            int ni = (int)i + di[k];
+            int nj = (int)j + dj[k];
+            if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
+            size_t a = vid((int)t, (int)i, (int)j, sz);
+            size_t b = vid((int)t, ni, nj, sz);
+            size_t ap = a - dv;
+            size_t bp = b - dv;
+            auto val_a  = fetch_fixed_pair(t, a);
+            auto val_b  = fetch_fixed_pair(t, b);
+            auto val_ap = fetch_fixed_pair(t, ap);
+            auto val_bp = fetch_fixed_pair(t, bp);
+
+            if (k == 0 || k == 3 || k == 5) {
+              if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
+                                                      val_ap.second, val_b.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+              if (has_cp(cp_faces, a, ap, bp)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_ap.first, val_a.first,
+                                                      val_bp.second, val_ap.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+            } else {
+              if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
+                                                      val_bp.second, val_b.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+              if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
+              {
+                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
+                                                      val_ap.second, val_bp.second, val_a.second);
+                if (eb < required_eb) required_eb = eb;
+              }
+            }
+          }
+        }
+
+        // (C) 内部剖分面
+        if (t + 1 < Tt) {
+          // 使用与上面相同的拓扑顺序
+          int i_int = (int)i;
+          int j_int = (int)j;
+
+          auto valid = [&](int x, int limit){ return x >= 0 && x < limit; };
+
+          if (valid(i_int - 1, (int)H) && valid(j_int + 1, (int)W)) {
+            size_t f1a  = vid((int)t, i_int,     j_int,     sz);
+            size_t f1b  = vid((int)t, i_int,     j_int + 1, sz);
+            size_t f1c  = vid((int)t, i_int - 1, j_int,     sz);
+            size_t f1ap = f1a + dv;
+            size_t f1bp = f1b + dv;
+            size_t f1cp = f1c + dv;
+            auto va = fetch_fixed_pair(t, f1a);
+            auto vb = fetch_fixed_pair(t, f1b);
+            auto vap = fetch_fixed_pair(t, f1ap);
+            auto vbp = fetch_fixed_pair(t, f1bp);
+            auto vcp = fetch_fixed_pair(t, f1cp);
+            if (has_cp(cp_faces, f1a, f1cp, f1b)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
+                                                    vb.second, vcp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+            if (has_cp(cp_faces, f1a, f1cp, f1bp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vcp.first, va.first,
+                                                    vbp.second, vcp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+            size_t f2a  = vid((int)t, i_int,     j_int,     sz);
+            size_t f2b  = vid((int)t, i_int - 1, j_int,     sz);
+            size_t f2c  = vid((int)t, i_int - 1, j_int - 1, sz);
+            size_t f2ap = f2a + dv;
+            size_t f2bp = f2b + dv;
+            size_t f2cp = f2c + dv;
+            auto va = fetch_fixed_pair(t, f2a);
+            auto vap = fetch_fixed_pair(t, f2ap);
+            auto vbp = fetch_fixed_pair(t, f2bp);
+            auto vcp = fetch_fixed_pair(t, f2cp);
+            auto vc = fetch_fixed_pair(t, f2c);
+            if (has_cp(cp_faces, f2a, f2c, f2bp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
+                                                    vbp.second, vc.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+            if (has_cp(cp_faces, f2a, f2bp, f2cp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                    vcp.second, vbp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+            size_t f3a  = vid((int)t, i_int,     j_int,     sz);
+            size_t f3b  = vid((int)t, i_int - 1, j_int - 1, sz);
+            size_t f3c  = vid((int)t, i_int,     j_int - 1, sz);
+            size_t f3bp = f3b + dv;
+            auto va = fetch_fixed_pair(t, f3a);
+            auto vb = fetch_fixed_pair(t, f3b);
+            auto vbp = fetch_fixed_pair(t, f3bp);
+            auto vc = fetch_fixed_pair(t, f3c);
+            if (has_cp(cp_faces, f3a, f3bp, f3c)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
+                                                    vc.second, vbp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+            size_t f6a  = vid((int)t, i_int,     j_int,     sz);
+            size_t f6b  = vid((int)t, i_int,     j_int + 1, sz);
+            size_t f6c  = vid((int)t, i_int + 1, j_int + 1, sz);
+            size_t f6bp = f6b + dv;
+            auto va = fetch_fixed_pair(t, f6a);
+            auto vb = fetch_fixed_pair(t, f6b);
+            auto vbp = fetch_fixed_pair(t, f6bp);
+            auto vc = fetch_fixed_pair(t, f6c);
+            if (has_cp(cp_faces, f6a, f6bp, f6c)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
+                                                    vc.second, vbp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        if (t > 0) {
+          int i_int = (int)i;
+          int j_int = (int)j;
+          auto valid = [&](int x, int limit){ return x >= 0 && x < limit; };
+
+          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+            size_t f3a  = vid((int)t,     i_int,     j_int,     sz);
+            size_t f3b  = vid((int)t - 1, i_int - 1, j_int - 1, sz);
+            size_t f3c  = vid((int)t,     i_int,     j_int - 1, sz);
+            size_t f3cp = f3c - dv;
+            auto va = fetch_fixed_pair(t, f3a);
+            auto vb = fetch_fixed_pair(t, f3b);
+            auto vc = fetch_fixed_pair(t, f3c);
+            auto vcp = fetch_fixed_pair(t, f3cp);
+            if (has_cp(cp_faces, f3a, f3c, f3cp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vc.first, va.first,
+                                                    vcp.second, vc.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int + 1, (int)H) && valid(j_int - 1, (int)W)) {
+            size_t f4a  = vid((int)t,     i_int,     j_int,     sz);
+            size_t f4b  = vid((int)t - 1, i_int,     j_int - 1, sz);
+            size_t f4c  = vid((int)t - 1, i_int + 1, j_int - 1, sz);
+            size_t f4bp = f4b + dv;
+            size_t f4cp = f4c + dv;
+            auto va = fetch_fixed_pair(t, f4a);
+            auto vb = fetch_fixed_pair(t, f4b);
+            auto vc = fetch_fixed_pair(t, f4c);
+            auto vbp = fetch_fixed_pair(t, f4bp);
+            auto vcp = fetch_fixed_pair(t, f4cp);
+            if (has_cp(cp_faces, f4a, f4bp, f4cp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                    vcp.second, vbp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+            if (has_cp(cp_faces, f4a, f4cp, f4b)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
+                                                    vb.second, vcp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+            size_t f5a  = vid((int)t,     i_int,     j_int,     sz);
+            size_t f5b  = vid((int)t - 1, i_int + 1, j_int,     sz);
+            size_t f5c  = vid((int)t - 1, i_int + 1, j_int + 1, sz);
+            size_t f5bp = f5b + dv;
+            size_t f5cp = f5c + dv;
+            auto va = fetch_fixed_pair(t, f5a);
+            auto vb = fetch_fixed_pair(t, f5b);
+            auto vc = fetch_fixed_pair(t, f5c);
+            auto vbp = fetch_fixed_pair(t, f5bp);
+            auto vcp = fetch_fixed_pair(t, f5cp);
+            if (has_cp(cp_faces, f5a, f5bp, f5cp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                    vcp.second, vbp.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+            if (has_cp(cp_faces, f5a, f5c, f5bp)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
+                                                    vbp.second, vc.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+            size_t f6a  = vid((int)t,     i_int,     j_int,     sz);
+            size_t f6b  = vid((int)t,     i_int,     j_int + 1, sz);
+            size_t f6c  = vid((int)t - 1, i_int + 1, j_int + 1, sz);
+            auto va = fetch_fixed_pair(t, f6a);
+            auto vb = fetch_fixed_pair(t, f6b);
+            auto vc = fetch_fixed_pair(t, f6c);
+            if (has_cp(cp_faces, f6a, f6b, f6c)) required_eb = 0;
+            {
+              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vb.first, va.first,
+                                                    vc.second, vb.second, va.second);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        T abs_eb = required_eb;
+        int id = eb_exponential_quantize(abs_eb, base, log_of_base, threshold);
+        if (abs_eb == 0) {
+          *(eb_pos++) = 0;
+          unpred.push_back(float_curr_u[off]);
+          unpred.push_back(float_curr_v[off]);
+          dec_curr_u[off] = curU_val;
+          dec_curr_v[off] = curV_val;
+          continue;
+        }
+
+        *eb_pos = id;
+        bool unpred_flag = false;
+        T dec_val[2];
+        T abs_err_fp_q[2] = {0,0};
+
+        for (int comp = 0; comp < 2; ++comp) {
+          const T curv = (comp == 0) ? curU_val : curV_val;
+          const std::vector<T>& prev_buf = (comp == 0) ? dec_prev_u : dec_prev_v;
+          const std::vector<T>& curr_buf = (comp == 0) ? dec_curr_u : dec_curr_v;
+          auto sample_prev = [&](size_t row, size_t col)->T {
+            return prev_buf[row * W + col];
+          };
+          auto sample_curr = [&](size_t row, size_t col)->T {
+            return curr_buf[row * W + col];
+          };
+
+          T d0 = (t && i && j) ? sample_prev(i - 1, j - 1) : 0;
+          T d1 = (t && i)     ? sample_prev(i - 1, j)     : 0;
+          T d2 = (t && j)     ? sample_prev(i,     j - 1) : 0;
+          T d3 = (t)          ? sample_prev(i,     j)     : 0;
+          T d4 = (i && j)     ? sample_curr(i - 1, j - 1) : 0;
+          T d5 = (i)          ? sample_curr(i - 1, j)     : 0;
+          T d6 = (j)          ? sample_curr(i,     j - 1) : 0;
+          T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
+
+          T diff = curv - pred;
+          T qd = (std::llabs(diff)/abs_eb) + 1;
+          if (qd < capacity) {
+            qd = (diff > 0) ? qd : -qd;
+            int qindex = (int)(qd/2) + intv_radius;
+            dq_pos[comp] = qindex;
+            dec_val[comp] = pred + 2 * ( (T)qindex - (T)intv_radius ) * abs_eb;
+            if (std::llabs(dec_val[comp] - curv) > abs_eb) {
+              unpred_flag = true;
+              break;
+            }
+            abs_err_fp_q[comp] = std::llabs(dec_val[comp] - curv);
+          } else {
+            unpred_flag = true;
+            break;
+          }
+        }
+
+        if (unpred_flag) {
+          *(eb_pos++) = 0;
+          unpred.push_back(float_curr_u[off]);
+          unpred.push_back(float_curr_v[off]);
+          dec_curr_u[off] = curU_val;
+          dec_curr_v[off] = curV_val;
+        } else {
+          ++eb_pos;
+          dq_pos += 2;
+          dec_curr_u[off] = dec_val[0];
+          dec_curr_v[off] = dec_val[1];
+          double abs_eb_fp = (double)abs_eb / (double)scale;
+          double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
+          double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
+          if (abs_eb_fp > enc_max_abs_eb_fp) enc_max_abs_eb_fp = abs_eb_fp;
+          double real_err = std::max(err_u_fp, err_v_fp);
+          if (real_err > enc_max_real_err_fp) enc_max_real_err_fp = real_err;
+        }
+      }
+    }
+
+    // rotate buffers for next timestep
+    dec_prev_u.swap(dec_curr_u);
+    dec_prev_v.swap(dec_curr_v);
+    std::fill(dec_curr_u.begin(), dec_curr_u.end(), 0);
+    std::fill(dec_curr_v.begin(), dec_curr_v.end(), 0);
+
+    u_prev.swap(u_curr);
+    v_prev.swap(v_curr);
+    float_prev_u.swap(float_curr_u);
+    float_prev_v.swap(float_curr_v);
+
+    if (t + 1 < Tt) {
+      u_curr.swap(u_next);
+      v_curr.swap(v_next);
+      float_curr_u.swap(float_next_u);
+      float_curr_v.swap(float_next_v);
+      if (t + 2 < Tt) {
+        if (!load_layer_fixed(t + 2, u_next, v_next, &float_next_u, &float_next_v, false)) {
+          std::free(eb_quant_index);
+          std::free(data_quant_index);
+          compressed_size = 0;
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  unsigned char *compressed = (unsigned char*)std::malloc((size_t)(2 * H * W * Tt * sizeof(T)));
+  if (!compressed) {
+    std::free(eb_quant_index);
+    std::free(data_quant_index);
+    compressed_size = 0;
+    return nullptr;
+  }
+  unsigned char *pos = compressed;
+
+  write_variable_to_dst(pos, scale);
+  std::cout << "write scale = " << (long long)scale << "\n";
+  write_variable_to_dst(pos, base);
+  write_variable_to_dst(pos, threshold);
+  write_variable_to_dst(pos, intv_radius);
+
+  size_t unpred_cnt = unpred.size();
+  write_variable_to_dst(pos, unpred_cnt);
+  if (unpred_cnt) {
+    write_array_to_dst(pos, unpred.data(), unpred_cnt);
+  }
+
+  size_t eb_quant_num = (size_t)(eb_pos - eb_quant_index);
+  write_variable_to_dst(pos, eb_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_quant_index, eb_quant_num, pos);
+  std::free(eb_quant_index);
+
+  size_t data_quant_num = (size_t)(dq_pos - data_quant_index);
+  write_variable_to_dst(pos, data_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*capacity, data_quant_index, data_quant_num, pos);
+  std::free(data_quant_index);
+
+  compressed_size = (size_t)(pos - compressed);
+  return compressed;
+}
+
+template<typename T_data, typename LayerFetcher>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_streaming(
+    LayerFetcher&& fetch_layer,
+    size_t r1, size_t r2, size_t r3,
+    size_t& compressed_size,
+    double max_pwr_eb,
+    EbMode mode)
+{
+  return sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl<T_data>(
+      std::forward<LayerFetcher>(fetch_layer), r1, r2, r3,
+      compressed_size, max_pwr_eb, mode);
+}
+
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_streaming(
+    const T_data* U,
+    const T_data* V,
+    size_t r1, size_t r2, size_t r3,
+    size_t& compressed_size,
+    double max_pwr_eb,
+    EbMode mode)
+{
+  const size_t H = r1, W = r2;
+  const size_t layer_size = H * W;
+  auto loader = [&](size_t t, T_data* dstU, T_data* dstV) {
+    const size_t offset = t * layer_size;
+    std::copy_n(U + offset, layer_size, dstU);
+    std::copy_n(V + offset, layer_size, dstV);
+    return true;
+  };
+  return sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl<T_data>(
+      loader, r1, r2, r3, compressed_size, max_pwr_eb, mode);
+}
+
+
 
 // ---------------- 解压主函数 ----------------
 template<typename T_data>
@@ -2080,23 +2901,60 @@ int main(int argc, char** argv) {
     std::cout << "U_file: " << u_path << ", V_file: " << v_path << "\n";
     std::cout << "Dimensions: H=" << dim_H << ", W=" << dim_W << ", T=" << dim_T << "\n";
     std::cout << "Error mode: " << (mode == EbMode::Absolute ? "Absolute" : "Relative") << ", Error bound: " << error_bound << "\n";
-    //read data
-    size_t num_elements =0;
-    float * U_ptr = readfile<float>(u_path.c_str(),num_elements);
-    float * V_ptr = readfile<float>(v_path.c_str(),num_elements);
-    //调用压缩
+    const size_t total_elements = dim_H * dim_W * dim_T;
+    size_t num_elements = total_elements;
+    float* U_ptr = nullptr;
+    float* V_ptr = nullptr;
+
+#if STREAMING
+    const size_t layer_elems = dim_H * dim_W;
+    const std::streamsize layer_bytes =
+        static_cast<std::streamsize>(layer_elems) * static_cast<std::streamsize>(sizeof(float));
+    std::ifstream fin_u(u_path, std::ios::binary);
+    std::ifstream fin_v(v_path, std::ios::binary);
+    if (!fin_u.is_open() || !fin_v.is_open()) {
+        std::cerr << "[ERR] failed to open input files for streaming mode." << std::endl;
+        return 1;
+    }
+    auto loader = [&](size_t t, float* slabU, float* slabV) -> bool {
+        const std::streamoff offset =
+            static_cast<std::streamoff>(t) * static_cast<std::streamoff>(layer_bytes);
+        fin_u.clear();
+        fin_v.clear();
+        fin_u.seekg(offset);
+        fin_v.seekg(offset);
+        if (!fin_u.good() || !fin_v.good()) return false;
+        fin_u.read(reinterpret_cast<char*>(slabU), layer_bytes);
+        fin_v.read(reinterpret_cast<char*>(slabV), layer_bytes);
+        return fin_u.gcount() == layer_bytes && fin_v.gcount() == layer_bytes;
+    };
+#else
+    num_elements = 0;
+    U_ptr = readfile<float>(u_path.c_str(), num_elements);
+    V_ptr = readfile<float>(v_path.c_str(), num_elements);
+#endif
+
     auto start_t = std::chrono::high_resolution_clock::now();
     size_t compressed_size = 0;
-    // unsigned char* compressed =
-    //     sz_compress_cp_preserve_sos_2p5d_fp<float>(
-    // U_ptr, V_ptr, 450, 150, 2001, compressed_size, mode,error_bound);
-    
+
     //把dimension当作filename转换成string
     std::string dim_str = std::to_string(dim_W) + "x" + std::to_string(dim_H) + "x" + std::to_string(dim_T);
 
+#if STREAMING
+    auto* compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_streaming<float>(
+        loader,
+        dim_H, dim_W, dim_T,
+        compressed_size, error_bound, mode);
+#else
     auto* compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
-    U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T, // 450,150,2001
-    compressed_size, error_bound,mode);
+        U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T,
+        compressed_size, error_bound, mode);
+#endif
+
+#if STREAMING
+    fin_u.close();
+    fin_v.close();
+#endif
 
     if (!compressed){
         std::cerr << "[ERR] compression returned null.\n";
@@ -2109,7 +2967,10 @@ int main(int argc, char** argv) {
     std::free(compressed);
     auto end_t = std::chrono::high_resolution_clock::now();
     cout << "compression time in sec:" << std::chrono::duration<double>(end_t - start_t).count() << endl;
-    cout << "compressed size (after lossless): " << lossless_outsize << " bytes." << "ratio = " << (2*num_elements*sizeof(float))/double(lossless_outsize) << endl;
+    cout << "compressed size (after lossless): " << lossless_outsize << " bytes. "
+         << "ratio = "
+         << (2.0 * static_cast<double>(total_elements) * sizeof(float)) / double(lossless_outsize)
+         << endl;
     
     //调用解压
     auto dec_start_t = std::chrono::high_resolution_clock::now();
@@ -2134,23 +2995,44 @@ int main(int argc, char** argv) {
 
 
     #if VERIFY
-    //verify
     printf("start verify....\n");
-    float * U_ori = readfile<float>(u_path.c_str(),num_elements);
-    float * V_ori = readfile<float>(v_path.c_str(),num_elements);
+    size_t verify_elements = total_elements;
+    float* U_ori = nullptr;
+    float* V_ori = nullptr;
+    bool free_original_buffers = false;
+    #if STREAMING
+    size_t file_elements_u = 0, file_elements_v = 0;
+    U_ori = readfile<float>(u_path.c_str(), file_elements_u);
+    V_ori = readfile<float>(v_path.c_str(), file_elements_v);
+    if (!U_ori || !V_ori || file_elements_u != total_elements || file_elements_v != total_elements) {
+        std::cerr << "[ERR] streaming verification failed to load original data." << std::endl;
+        std::free(decompressed);
+        std::free(U_dec);
+        std::free(V_dec);
+        if (U_ori) std::free(U_ori);
+        if (V_ori) std::free(V_ori);
+        return 4;
+    }
+    verify_elements = file_elements_u;
+    free_original_buffers = true;
+    #else
+    verify_elements = num_elements;
+    U_ori = U_ptr;
+    V_ori = V_ptr;
+    #endif
+
     verify(U_ori, V_ori, U_dec, V_dec, H, W, T);
-    //check if pre-compute result consistent    
-    int64_t *U_ori_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    int64_t *V_ori_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    int64_t range_ori=0;
-    int64_t scale_ori = convert_to_fixed_point(U_ori,V_ori,num_elements,U_ori_fp,V_ori_fp,range_ori);
+
+    int64_t* U_ori_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
+    int64_t* V_ori_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
+    int64_t range_ori = 0;
+    int64_t scale_ori = convert_to_fixed_point(U_ori, V_ori, verify_elements, U_ori_fp, V_ori_fp, range_ori);
     printf("original scale = %ld\n", scale_ori);
-    auto cp_faces_ori = compute_cp_2p5d_faces(U_ori_fp, V_ori_fp, H, W, T,dim_str);
+    auto cp_faces_ori = compute_cp_2p5d_faces(U_ori_fp, V_ori_fp, H, W, T, dim_str);
 
-
-    int64_t *U_dec_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    int64_t *V_dec_fp=(int64_t*)std::malloc(num_elements*sizeof(int64_t));
-    convert_to_fixed_point_given_factor(U_dec,V_dec,num_elements,U_dec_fp,V_dec_fp,scale_ori);
+    int64_t* U_dec_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
+    int64_t* V_dec_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
+    convert_to_fixed_point_given_factor(U_dec, V_dec, verify_elements, U_dec_fp, V_dec_fp, scale_ori);
 
     auto cp_faces_dec = compute_cp_2p5d_faces(U_dec_fp, V_dec_fp, H, W, T);
 
@@ -2170,15 +3052,17 @@ int main(int argc, char** argv) {
 
 
 
-    std::free(U_ori);
-    std::free(V_ori);
+    if (free_original_buffers) {
+        std::free(U_ori);
+        std::free(V_ori);
+    }
     std::free(U_ori_fp);
     std::free(V_ori_fp);
     std::free(U_dec_fp);
     std::free(V_dec_fp);
     #endif
 
-    #if CPSZ_BASELINE
+    #if CPSZ_BASELINE && !STREAMING
     float *U_dec_cpsz = nullptr;
     float *V_dec_cpsz = nullptr;
     int64_t *U_dec_cpsz_fp = nullptr;
