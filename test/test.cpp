@@ -1946,26 +1946,196 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
 
   const size_t dv = H * W;
 
+  #ifdef _OPENMP
+  const size_t block_rows_cp = 32;
+  const size_t block_cols_cp = 32;
+  const int cp_threads = omp_get_max_threads();
+  std::vector<std::vector<FaceKeySZ>> cp_thread_faces(cp_threads);
+  auto flush_thread_faces = [&](std::vector<std::vector<FaceKeySZ>>& buffers){
+    for (auto &vec : buffers){
+      for (const auto &f : vec){
+        cp_faces.emplace(f);
+      }
+      vec.clear();
+    }
+  };
+  #endif
+
   for (size_t t = 0; t < Tt; ++t) {
     if (t % 1000 == 0) {
       printf("pre-compute cp lower layer %zu / %zu\n", t, Tt);
     }
-    // (1) 同层面
+
+    #ifdef _OPENMP
+    const size_t layer_i_limit = (H > 0) ? (H - 1) : 0;
+    const size_t layer_j_limit = (W > 0) ? (W - 1) : 0;
+    const size_t blocks_i_layer = (layer_i_limit + block_rows_cp - 1) / block_rows_cp;
+    const size_t blocks_j_layer = (layer_j_limit + block_cols_cp - 1) / block_cols_cp;
+    const size_t blocks_i_full  = (H + block_rows_cp - 1) / block_rows_cp;
+    const size_t blocks_j_fullm1 = (W > 0) ? ((W - 1 + block_cols_cp - 1) / block_cols_cp) : 0;
+    const size_t blocks_i_m1 = (H > 0) ? ((H - 1 + block_rows_cp - 1) / block_rows_cp) : 0;
+    const size_t blocks_j_full = (W + block_cols_cp - 1) / block_cols_cp;
+
+    #pragma omp parallel
+    {
+      auto& local_faces = cp_thread_faces[omp_get_thread_num()];
+      local_faces.clear();
+
+      if (layer_i_limit && layer_j_limit) {
+        const size_t total_blocks = blocks_i_layer * blocks_j_layer;
+        #pragma omp for schedule(static)
+        for (size_t block = 0; block < total_blocks; ++block) {
+          size_t bi = block / blocks_j_layer;
+          size_t bj = block % blocks_j_layer;
+          size_t i_begin = bi * block_rows_cp;
+          size_t i_end = std::min(i_begin + block_rows_cp, layer_i_limit);
+          size_t j_begin = bj * block_cols_cp;
+          size_t j_end = std::min(j_begin + block_cols_cp, layer_j_limit);
+          for (size_t i = i_begin; i < i_end; ++i) {
+            for (size_t j = j_begin; j < j_end; ++j) {
+              size_t v00 = vid((int)t,(int)i,(int)j,sz);
+              size_t v10 = vid((int)t,(int)i,(int)(j+1),sz);
+              size_t v01 = vid((int)t,(int)(i+1),(int)j,sz);
+              size_t v11 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+              if (eval_face(t, v00, v01, v11)) local_faces.emplace_back(v00, v01, v11);
+              if (eval_face(t, v00, v10, v11)) local_faces.emplace_back(v00, v10, v11);
+            }
+          }
+        }
+      }
+
+      if (t + 1 < Tt) {
+        if (t % 1000 == 0) {
+          #pragma omp single
+          printf("pre-compute cp side_hor layer %zu / %zu\n", t, Tt);
+        }
+        if (blocks_i_full && (W > 1)) {
+          const size_t total_blocks_h = blocks_i_full * blocks_j_layer;
+          #pragma omp for schedule(static)
+          for (size_t block = 0; block < total_blocks_h; ++block) {
+            size_t bi = block / blocks_j_layer;
+            size_t bj = block % blocks_j_layer;
+            size_t i_begin = bi * block_rows_cp;
+            size_t i_end = std::min(i_begin + block_rows_cp, H);
+            size_t j_begin = bj * block_cols_cp;
+            size_t j_end = std::min(j_begin + block_cols_cp, W - 1);
+            for (size_t i = i_begin; i < i_end; ++i) {
+              for (size_t j = j_begin; j < j_end; ++j) {
+                size_t a = vid((int)t,(int)i,(int)j,sz);
+                size_t b = vid((int)t,(int)i,(int)(j+1),sz);
+                size_t ap = a + dv;
+                size_t bp = b + dv;
+                if (eval_face(t, a, b, bp)) local_faces.emplace_back(a, b, bp);
+                if (eval_face(t, a, bp, ap)) local_faces.emplace_back(a, bp, ap);
+              }
+            }
+          }
+        }
+
+        if (t % 1000 == 0) {
+          #pragma omp single
+          printf("pre-compute cp side_ver layer %zu / %zu\n", t, Tt);
+        }
+        if (blocks_i_m1 && blocks_j_full) {
+          const size_t total_blocks_v = blocks_i_m1 * blocks_j_full;
+          #pragma omp for schedule(static)
+          for (size_t block = 0; block < total_blocks_v; ++block) {
+            size_t bi = block / blocks_j_full;
+            size_t bj = block % blocks_j_full;
+            size_t i_begin = bi * block_rows_cp;
+            size_t i_end = std::min(i_begin + block_rows_cp, (H > 0) ? (H - 1) : 0);
+            size_t j_begin = bj * block_cols_cp;
+            size_t j_end = std::min(j_begin + block_cols_cp, W);
+            for (size_t i = i_begin; i < i_end; ++i) {
+              for (size_t j = j_begin; j < j_end; ++j) {
+                size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+                size_t ax0y1 = vid((int)t,(int)(i+1),(int)j,sz);
+                size_t bx0y0 = ax0y0 + dv;
+                size_t bx0y1 = ax0y1 + dv;
+                if (eval_face(t, ax0y0, ax0y1, bx0y0)) local_faces.emplace_back(ax0y0, ax0y1, bx0y0);
+                if (eval_face(t, ax0y1, bx0y0, bx0y1)) local_faces.emplace_back(ax0y1, bx0y0, bx0y1);
+              }
+            }
+          }
+        }
+
+        if (t % 1000 == 0) {
+          #pragma omp single
+          printf("pre-compute cp diag layer %zu / %zu\n", t, Tt);
+        }
+        if (layer_i_limit && layer_j_limit) {
+          const size_t total_blocks_d = blocks_i_layer * blocks_j_layer;
+          #pragma omp for schedule(static)
+          for (size_t block = 0; block < total_blocks_d; ++block) {
+            size_t bi = block / blocks_j_layer;
+            size_t bj = block % blocks_j_layer;
+            size_t i_begin = bi * block_rows_cp;
+            size_t i_end = std::min(i_begin + block_rows_cp, layer_i_limit);
+            size_t j_begin = bj * block_cols_cp;
+            size_t j_end = std::min(j_begin + block_cols_cp, layer_j_limit);
+            for (size_t i = i_begin; i < i_end; ++i) {
+              for (size_t j = j_begin; j < j_end; ++j) {
+                size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+                size_t ax1y1 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+                size_t bx0y0 = ax0y0 + dv;
+                size_t bx1y1 = ax1y1 + dv;
+                if (eval_face(t, ax0y0, ax1y1, bx0y0)) local_faces.emplace_back(ax0y0, ax1y1, bx0y0);
+                if (eval_face(t, ax1y1, bx0y0, bx1y1)) local_faces.emplace_back(ax1y1, bx0y0, bx1y1);
+              }
+            }
+          }
+        }
+
+        if (t % 1000 == 0) {
+          #pragma omp single
+          printf("pre-compute cp inside layer %zu / %zu\n", t, Tt);
+        }
+        if (layer_i_limit && layer_j_limit) {
+          const size_t total_blocks_in = blocks_i_layer * blocks_j_layer;
+          #pragma omp for schedule(static)
+          for (size_t block = 0; block < total_blocks_in; ++block) {
+            size_t bi = block / blocks_j_layer;
+            size_t bj = block % blocks_j_layer;
+            size_t i_begin = bi * block_rows_cp;
+            size_t i_end = std::min(i_begin + block_rows_cp, layer_i_limit);
+            size_t j_begin = bj * block_cols_cp;
+            size_t j_end = std::min(j_begin + block_cols_cp, layer_j_limit);
+            for (size_t i = i_begin; i < i_end; ++i) {
+              for (size_t j = j_begin; j < j_end; ++j) {
+                size_t ax0y0 = vid((int)t,(int)i,(int)j,sz);
+                size_t ax0y1 = vid((int)t,(int)(i+1),(int)j,sz);
+                size_t ax1y1 = vid((int)t,(int)(i+1),(int)(j+1),sz);
+                size_t ax1y0 = vid((int)t,(int)i,(int)(j+1),sz);
+                size_t bx0y0 = ax0y0 + dv;
+                size_t bx0y1 = ax0y1 + dv;
+                size_t bx1y1 = ax1y1 + dv;
+                size_t bx1y0 = ax1y0 + dv;
+                if (eval_face(t, ax0y1, bx0y0, ax1y1)) local_faces.emplace_back(ax0y1, bx0y0, ax1y1);
+                if (eval_face(t, ax0y1, bx0y0, bx1y1)) local_faces.emplace_back(ax0y1, bx0y0, bx1y1);
+                if (eval_face(t, ax0y0, ax1y1, bx1y0)) local_faces.emplace_back(ax0y0, ax1y1, bx1y0);
+                if (eval_face(t, ax1y1, bx0y0, bx1y0)) local_faces.emplace_back(ax1y1, bx0y0, bx1y0);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    flush_thread_faces(cp_thread_faces);
+    #else
+    if (t % 1000 == 0) {
+      printf("pre-compute cp lower layer %zu / %zu\n", t, Tt);
+    }
     for (size_t i = 0; i + 1 < H; ++i) {
       for (size_t j = 0; j + 1 < W; ++j) {
         size_t v00 = vid((int)t,(int)i,(int)j,sz);
         size_t v10 = vid((int)t,(int)i,(int)(j+1),sz);
         size_t v01 = vid((int)t,(int)(i+1),(int)j,sz);
         size_t v11 = vid((int)t,(int)(i+1),(int)(j+1),sz);
-        if (eval_face(t, v00, v01, v11)) {
-          cp_faces.emplace(v00, v01, v11);
-        }
-        if (eval_face(t, v00, v10, v11)) {
-          cp_faces.emplace(v00, v10, v11);
-        }
+        if (eval_face(t, v00, v01, v11)) cp_faces.emplace(v00, v01, v11);
+        if (eval_face(t, v00, v10, v11)) cp_faces.emplace(v00, v10, v11);
       }
     }
-
     if (t + 1 < Tt) {
       if (t % 1000 == 0) {
         printf("pre-compute cp side_hor layer %zu / %zu\n", t, Tt);
@@ -1980,7 +2150,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
           if (eval_face(t, a, bp, ap)) cp_faces.emplace(a, bp, ap);
         }
       }
-
       if (t % 1000 == 0) {
         printf("pre-compute cp side_ver layer %zu / %zu\n", t, Tt);
       }
@@ -1994,7 +2163,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
           if (eval_face(t, ax0y1, bx0y0, bx0y1)) cp_faces.emplace(ax0y1, bx0y0, bx0y1);
         }
       }
-
       if (t % 1000 == 0) {
         printf("pre-compute cp diag layer %zu / %zu\n", t, Tt);
       }
@@ -2008,7 +2176,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
           if (eval_face(t, ax1y1, bx0y0, bx1y1)) cp_faces.emplace(ax1y1, bx0y0, bx1y1);
         }
       }
-
       if (t % 1000 == 0) {
         printf("pre-compute cp inside layer %zu / %zu\n", t, Tt);
       }
@@ -2022,7 +2189,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
           size_t bx0y1 = ax0y1 + dv;
           size_t bx1y1 = ax1y1 + dv;
           size_t bx1y0 = ax1y0 + dv;
-
           if (eval_face(t, ax0y1, bx0y0, ax1y1)) cp_faces.emplace(ax0y1, bx0y0, ax1y1);
           if (eval_face(t, ax0y1, bx0y0, bx1y1)) cp_faces.emplace(ax0y1, bx0y0, bx1y1);
           if (eval_face(t, ax0y0, ax1y1, bx1y0)) cp_faces.emplace(ax0y0, ax1y1, bx1y0);
@@ -2030,6 +2196,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
         }
       }
     }
+    #endif
 
     // rotate buffers
     if (t + 1 < Tt) {
@@ -2095,6 +2262,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
 
   std::vector<T> dec_prev_u(layer_size, 0), dec_prev_v(layer_size, 0);
   std::vector<T> dec_curr_u(layer_size, 0), dec_curr_v(layer_size, 0);
+  std::vector<T> required_eb_layer(layer_size, max_eb);
 
   std::vector<T_data> float_prev_u(layer_size, (T_data)0);
   std::vector<T_data> float_prev_v(layer_size, (T_data)0);
@@ -2112,7 +2280,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
     compressed_size = 0;
     return nullptr;
   }
-  bool have_next_layer = false;
   if (Tt > 1) {
     if (!load_layer_fixed(1, u_next, v_next, &float_next_u, &float_next_v, false)) {
       std::free(eb_quant_index);
@@ -2120,7 +2287,6 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
       compressed_size = 0;
       return nullptr;
     }
-    have_next_layer = true;
   }
 
   const int di[6] = { 0,  0,  1, -1,  1, -1 };
@@ -2140,324 +2306,340 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming_impl(
     return { u_curr[off], v_curr[off] };
   };
 
-  auto fetch_prev_dec = [&](size_t off)->std::pair<T,T> {
-    return { dec_prev_u[off], dec_prev_v[off] };
-  };
+  auto compute_required_eb = [&](size_t t_idx, size_t i_idx, size_t j_idx)->T {
+    size_t global_idx = vid((int)t_idx,(int)i_idx,(int)j_idx,sz);
+    T required_eb = max_eb;
 
-  auto fetch_curr_dec = [&](size_t off)->std::pair<T,T> {
-    return { dec_curr_u[off], dec_curr_v[off] };
+    for (int ci = (int)i_idx - 1; ci <= (int)i_idx; ++ci) {
+      if (!in_range(ci, (int)H - 1)) continue;
+      for (int cj = (int)j_idx - 1; cj <= (int)j_idx; ++cj) {
+        if (!in_range(cj, (int)W - 1)) continue;
+        size_t v00 = vid((int)t_idx, ci,   cj,   sz);
+        size_t v10 = vid((int)t_idx, ci,   cj+1, sz);
+        size_t v01 = vid((int)t_idx, ci+1, cj,   sz);
+        size_t v11 = vid((int)t_idx, ci+1, cj+1, sz);
+
+        auto u01 = fetch_fixed_pair(t_idx, v01);
+        auto u11 = fetch_fixed_pair(t_idx, v11);
+        auto u10 = fetch_fixed_pair(t_idx, v10);
+        auto u00 = fetch_fixed_pair(t_idx, v00);
+
+        if (global_idx == v00 || global_idx == v01 || global_idx == v11) {
+          if (has_cp(cp_faces, v00, v01, v11)) required_eb = 0;
+          T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u01.first, u00.first,
+                                                u11.second, u01.second, u00.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+        if (global_idx == v00 || global_idx == v10 || global_idx == v11) {
+          if (has_cp(cp_faces, v00, v10, v11)) required_eb = 0;
+          T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u10.first, u00.first,
+                                                u11.second, u10.second, u00.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+    }
+
+    if (t_idx + 1 < Tt) {
+      for (int k = 0; k < 6; ++k) {
+        int ni = (int)i_idx + di[k];
+        int nj = (int)j_idx + dj[k];
+        if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
+        size_t a = vid((int)t_idx, (int)i_idx, (int)j_idx, sz);
+        size_t b = vid((int)t_idx, ni, nj, sz);
+        size_t ap = a + dv;
+        size_t bp = b + dv;
+        auto val_a  = fetch_fixed_pair(t_idx, a);
+        auto val_b  = fetch_fixed_pair(t_idx, b);
+        auto val_ap = fetch_fixed_pair(t_idx, ap);
+        auto val_bp = fetch_fixed_pair(t_idx, bp);
+
+        if (k == 0 || k == 3 || k == 5) {
+          if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
+                                                  val_bp.second, val_b.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+          if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
+                                                  val_ap.second, val_bp.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+        } else {
+          if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
+                                                  val_ap.second, val_b.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+        }
+      }
+    }
+
+    if (t_idx > 0) {
+      for (int k = 0; k < 6; ++k) {
+        int ni = (int)i_idx + di[k];
+        int nj = (int)j_idx + dj[k];
+        if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
+        size_t a = vid((int)t_idx, (int)i_idx, (int)j_idx, sz);
+        size_t b = vid((int)t_idx, ni, nj, sz);
+        size_t ap = a - dv;
+        size_t bp = b - dv;
+        auto val_a  = fetch_fixed_pair(t_idx, a);
+        auto val_b  = fetch_fixed_pair(t_idx, b);
+        auto val_ap = fetch_fixed_pair(t_idx, ap);
+        auto val_bp = fetch_fixed_pair(t_idx, bp);
+
+        if (k == 0 || k == 3 || k == 5) {
+          if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
+                                                  val_ap.second, val_b.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+          if (has_cp(cp_faces, a, ap, bp)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_ap.first, val_a.first,
+                                                  val_bp.second, val_ap.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+        } else {
+          if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
+                                                  val_bp.second, val_b.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+          if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
+          {
+            T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
+                                                  val_ap.second, val_bp.second, val_a.second);
+            if (eb < required_eb) required_eb = eb;
+          }
+        }
+      }
+    }
+
+    auto valid = [&](int x, int limit){ return x >= 0 && x < limit; };
+
+    if (t_idx + 1 < Tt) {
+      int i_int = (int)i_idx;
+      int j_int = (int)j_idx;
+      if (valid(i_int - 1, (int)H) && valid(j_int + 1, (int)W)) {
+        size_t f1a  = vid((int)t_idx, i_int,     j_int,     sz);
+        size_t f1b  = vid((int)t_idx, i_int,     j_int + 1, sz);
+        size_t f1c  = vid((int)t_idx, i_int - 1, j_int,     sz);
+        size_t f1ap = f1a + dv;
+        size_t f1bp = f1b + dv;
+        size_t f1cp = f1c + dv;
+        auto va = fetch_fixed_pair(t_idx, f1a);
+        auto vb = fetch_fixed_pair(t_idx, f1b);
+        auto vcp = fetch_fixed_pair(t_idx, f1cp);
+        auto vbp = fetch_fixed_pair(t_idx, f1bp);
+        if (has_cp(cp_faces, f1a, f1cp, f1b)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
+                                                vb.second, vcp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+        if (has_cp(cp_faces, f1a, f1cp, f1bp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vcp.first, va.first,
+                                                vbp.second, vcp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+        size_t f2a  = vid((int)t_idx, i_int,     j_int,     sz);
+        size_t f2b  = vid((int)t_idx, i_int - 1, j_int,     sz);
+        size_t f2c  = vid((int)t_idx, i_int - 1, j_int - 1, sz);
+        size_t f2ap = f2a + dv;
+        size_t f2bp = f2b + dv;
+        size_t f2cp = f2c + dv;
+        auto va = fetch_fixed_pair(t_idx, f2a);
+        auto vc = fetch_fixed_pair(t_idx, f2c);
+        auto vbp = fetch_fixed_pair(t_idx, f2bp);
+        auto vcp = fetch_fixed_pair(t_idx, f2cp);
+        if (has_cp(cp_faces, f2a, f2c, f2bp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
+                                                vbp.second, vc.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+        if (has_cp(cp_faces, f2a, f2bp, f2cp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                vcp.second, vbp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+        size_t f3a  = vid((int)t_idx, i_int,     j_int,     sz);
+        size_t f3b  = vid((int)t_idx, i_int - 1, j_int - 1, sz);
+        size_t f3c  = vid((int)t_idx, i_int,     j_int - 1, sz);
+        size_t f3bp = f3b + dv;
+        auto va = fetch_fixed_pair(t_idx, f3a);
+        auto vb = fetch_fixed_pair(t_idx, f3b);
+        auto vbp = fetch_fixed_pair(t_idx, f3bp);
+        auto vc = fetch_fixed_pair(t_idx, f3c);
+        if (has_cp(cp_faces, f3a, f3bp, f3c)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
+                                                vc.second, vbp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+        size_t f6a  = vid((int)t_idx, i_int,     j_int,     sz);
+        size_t f6b  = vid((int)t_idx, i_int,     j_int + 1, sz);
+        size_t f6c  = vid((int)t_idx, i_int + 1, j_int + 1, sz);
+        size_t f6bp = f6b + dv;
+        auto va = fetch_fixed_pair(t_idx, f6a);
+        auto vb = fetch_fixed_pair(t_idx, f6b);
+        auto vbp = fetch_fixed_pair(t_idx, f6bp);
+        auto vc = fetch_fixed_pair(t_idx, f6c);
+        if (has_cp(cp_faces, f6a, f6bp, f6c)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
+                                                vc.second, vbp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+    }
+
+    if (t_idx > 0) {
+      int i_int = (int)i_idx;
+      int j_int = (int)j_idx;
+      if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
+        size_t f3a  = vid((int)t_idx,     i_int,     j_int,     sz);
+        size_t f3b  = vid((int)t_idx - 1, i_int - 1, j_int - 1, sz);
+        size_t f3c  = vid((int)t_idx,     i_int,     j_int - 1, sz);
+        size_t f3cp = f3c - dv;
+        auto va = fetch_fixed_pair(t_idx, f3a);
+        auto vb = fetch_fixed_pair(t_idx, f3b);
+        auto vc = fetch_fixed_pair(t_idx, f3c);
+        auto vcp = fetch_fixed_pair(t_idx, f3cp);
+        if (has_cp(cp_faces, f3a, f3c, f3cp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vc.first, va.first,
+                                                vcp.second, vc.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int + 1, (int)H) && valid(j_int - 1, (int)W)) {
+        size_t f4a  = vid((int)t_idx,     i_int,     j_int,     sz);
+        size_t f4b  = vid((int)t_idx - 1, i_int,     j_int - 1, sz);
+        size_t f4c  = vid((int)t_idx - 1, i_int + 1, j_int - 1, sz);
+        size_t f4bp = f4b + dv;
+        size_t f4cp = f4c + dv;
+        auto va = fetch_fixed_pair(t_idx, f4a);
+        auto vb = fetch_fixed_pair(t_idx, f4b);
+        auto vc = fetch_fixed_pair(t_idx, f4c);
+        auto vbp = fetch_fixed_pair(t_idx, f4bp);
+        auto vcp = fetch_fixed_pair(t_idx, f4cp);
+        if (has_cp(cp_faces, f4a, f4bp, f4cp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                vcp.second, vbp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+        if (has_cp(cp_faces, f4a, f4cp, f4b)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
+                                                vb.second, vcp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+        size_t f5a  = vid((int)t_idx,     i_int,     j_int,     sz);
+        size_t f5b  = vid((int)t_idx - 1, i_int + 1, j_int,     sz);
+        size_t f5c  = vid((int)t_idx - 1, i_int + 1, j_int + 1, sz);
+        size_t f5bp = f5b + dv;
+        size_t f5cp = f5c + dv;
+        auto va = fetch_fixed_pair(t_idx, f5a);
+        auto vb = fetch_fixed_pair(t_idx, f5b);
+        auto vc = fetch_fixed_pair(t_idx, f5c);
+        auto vbp = fetch_fixed_pair(t_idx, f5bp);
+        auto vcp = fetch_fixed_pair(t_idx, f5cp);
+        if (has_cp(cp_faces, f5a, f5bp, f5cp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
+                                                vcp.second, vbp.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+        if (has_cp(cp_faces, f5a, f5c, f5bp)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
+                                                vbp.second, vc.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+
+      if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
+        size_t f6a  = vid((int)t_idx,     i_int,     j_int,     sz);
+        size_t f6b  = vid((int)t_idx,     i_int,     j_int + 1, sz);
+        size_t f6c  = vid((int)t_idx - 1, i_int + 1, j_int + 1, sz);
+        auto va = fetch_fixed_pair(t_idx, f6a);
+        auto vb = fetch_fixed_pair(t_idx, f6b);
+        auto vc = fetch_fixed_pair(t_idx, f6c);
+        if (has_cp(cp_faces, f6a, f6b, f6c)) required_eb = 0;
+        {
+          T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vb.first, va.first,
+                                                vc.second, vb.second, va.second);
+          if (eb < required_eb) required_eb = eb;
+        }
+      }
+    }
+
+    return required_eb;
   };
 
   for (size_t t = 0; t < Tt; ++t) {
     if (t % 100 == 0) {
       printf("processing slice %zu / %zu\n", t, Tt);
     }
+
+#ifdef _OPENMP
+    const size_t block_rows_eb = 8;
+    const size_t block_cols_eb = 8;
+    const size_t blocks_i_eb = (H + block_rows_eb - 1) / block_rows_eb;
+    const size_t blocks_j_eb = (W + block_cols_eb - 1) / block_cols_eb;
+    #pragma omp parallel for schedule(static)
+    for (size_t block = 0; block < blocks_i_eb * blocks_j_eb; ++block) {
+      size_t bi = block / blocks_j_eb;
+      size_t bj = block % blocks_j_eb;
+      size_t i_begin = bi * block_rows_eb;
+      size_t i_end = std::min(i_begin + block_rows_eb, H);
+      size_t j_begin = bj * block_cols_eb;
+      size_t j_end = std::min(j_begin + block_cols_eb, W);
+      for (size_t i = i_begin; i < i_end; ++i) {
+        for (size_t j = j_begin; j < j_end; ++j) {
+          size_t off = i * W + j;
+          required_eb_layer[off] = compute_required_eb(t, i, j);
+        }
+      }
+    }
+#else
     for (size_t i = 0; i < H; ++i) {
       for (size_t j = 0; j < W; ++j) {
-        size_t global_idx = vid((int)t,(int)i,(int)j,sz);
         size_t off = i * W + j;
+        required_eb_layer[off] = compute_required_eb(t, i, j);
+      }
+    }
+#endif
 
+    for (size_t i = 0; i < H; ++i) {
+      for (size_t j = 0; j < W; ++j) {
+        size_t off = i * W + j;
         const T curU_val = u_curr[off];
         const T curV_val = v_curr[off];
-
-        T required_eb = max_eb;
-
-        // (A) 同层
-        for (int ci = (int)i - 1; ci <= (int)i; ++ci) {
-          if (!in_range(ci, (int)H - 1)) continue;
-          for (int cj = (int)j - 1; cj <= (int)j; ++cj) {
-            if (!in_range(cj, (int)W - 1)) continue;
-            size_t v00 = vid((int)t, ci,   cj,   sz);
-            size_t v10 = vid((int)t, ci,   cj+1, sz);
-            size_t v01 = vid((int)t, ci+1, cj,   sz);
-            size_t v11 = vid((int)t, ci+1, cj+1, sz);
-
-            auto u01 = fetch_fixed_pair(t, v01);
-            auto u11 = fetch_fixed_pair(t, v11);
-            auto u10 = fetch_fixed_pair(t, v10);
-            auto u00 = fetch_fixed_pair(t, v00);
-
-            if (global_idx == v00 || global_idx == v01 || global_idx == v11) {
-              if (has_cp(cp_faces, v00, v01, v11)) required_eb = 0;
-              T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u01.first, u00.first,
-                                                    u11.second, u01.second, u00.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-            if (global_idx == v00 || global_idx == v10 || global_idx == v11) {
-              if (has_cp(cp_faces, v00, v10, v11)) required_eb = 0;
-              T eb = derive_cp_abs_eb_sos_online<T>(u11.first, u10.first, u00.first,
-                                                    u11.second, u10.second, u00.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-        }
-
-        // (B1) 侧面 [t, t+1]
-        if (t + 1 < Tt) {
-          for (int k = 0; k < 6; ++k) {
-            int ni = (int)i + di[k];
-            int nj = (int)j + dj[k];
-            if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
-            size_t a = vid((int)t, (int)i, (int)j, sz);
-            size_t b = vid((int)t, ni, nj, sz);
-            size_t ap = a + dv;
-            size_t bp = b + dv;
-            auto val_a  = fetch_fixed_pair(t, a);
-            auto val_b  = fetch_fixed_pair(t, b);
-            auto val_ap = fetch_fixed_pair(t, ap);
-            auto val_bp = fetch_fixed_pair(t, bp);
-
-            if (k == 0 || k == 3 || k == 5) {
-              if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
-                                                      val_bp.second, val_b.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-              if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
-                                                      val_ap.second, val_bp.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-            } else {
-              if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
-                                                      val_ap.second, val_b.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-            }
-          }
-        }
-
-        // (B2) 侧面 [t-1, t]
-        if (t > 0) {
-          for (int k = 0; k < 6; ++k) {
-            int ni = (int)i + di[k];
-            int nj = (int)j + dj[k];
-            if (!in_range(ni, (int)H) || !in_range(nj, (int)W)) continue;
-            size_t a = vid((int)t, (int)i, (int)j, sz);
-            size_t b = vid((int)t, ni, nj, sz);
-            size_t ap = a - dv;
-            size_t bp = b - dv;
-            auto val_a  = fetch_fixed_pair(t, a);
-            auto val_b  = fetch_fixed_pair(t, b);
-            auto val_ap = fetch_fixed_pair(t, ap);
-            auto val_bp = fetch_fixed_pair(t, bp);
-
-            if (k == 0 || k == 3 || k == 5) {
-              if (has_cp(cp_faces, a, b, ap)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_b.first, val_a.first,
-                                                      val_ap.second, val_b.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-              if (has_cp(cp_faces, a, ap, bp)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_ap.first, val_a.first,
-                                                      val_bp.second, val_ap.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-            } else {
-              if (has_cp(cp_faces, a, b, bp)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_bp.first, val_b.first, val_a.first,
-                                                      val_bp.second, val_b.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-              if (has_cp(cp_faces, a, bp, ap)) required_eb = 0;
-              {
-                T eb = derive_cp_abs_eb_sos_online<T>(val_ap.first, val_bp.first, val_a.first,
-                                                      val_ap.second, val_bp.second, val_a.second);
-                if (eb < required_eb) required_eb = eb;
-              }
-            }
-          }
-        }
-
-        // (C) 内部剖分面
-        if (t + 1 < Tt) {
-          // 使用与上面相同的拓扑顺序
-          int i_int = (int)i;
-          int j_int = (int)j;
-
-          auto valid = [&](int x, int limit){ return x >= 0 && x < limit; };
-
-          if (valid(i_int - 1, (int)H) && valid(j_int + 1, (int)W)) {
-            size_t f1a  = vid((int)t, i_int,     j_int,     sz);
-            size_t f1b  = vid((int)t, i_int,     j_int + 1, sz);
-            size_t f1c  = vid((int)t, i_int - 1, j_int,     sz);
-            size_t f1ap = f1a + dv;
-            size_t f1bp = f1b + dv;
-            size_t f1cp = f1c + dv;
-            auto va = fetch_fixed_pair(t, f1a);
-            auto vb = fetch_fixed_pair(t, f1b);
-            auto vap = fetch_fixed_pair(t, f1ap);
-            auto vbp = fetch_fixed_pair(t, f1bp);
-            auto vcp = fetch_fixed_pair(t, f1cp);
-            if (has_cp(cp_faces, f1a, f1cp, f1b)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
-                                                    vb.second, vcp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-            if (has_cp(cp_faces, f1a, f1cp, f1bp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vcp.first, va.first,
-                                                    vbp.second, vcp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
-            size_t f2a  = vid((int)t, i_int,     j_int,     sz);
-            size_t f2b  = vid((int)t, i_int - 1, j_int,     sz);
-            size_t f2c  = vid((int)t, i_int - 1, j_int - 1, sz);
-            size_t f2ap = f2a + dv;
-            size_t f2bp = f2b + dv;
-            size_t f2cp = f2c + dv;
-            auto va = fetch_fixed_pair(t, f2a);
-            auto vap = fetch_fixed_pair(t, f2ap);
-            auto vbp = fetch_fixed_pair(t, f2bp);
-            auto vcp = fetch_fixed_pair(t, f2cp);
-            auto vc = fetch_fixed_pair(t, f2c);
-            if (has_cp(cp_faces, f2a, f2c, f2bp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
-                                                    vbp.second, vc.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-            if (has_cp(cp_faces, f2a, f2bp, f2cp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
-                                                    vcp.second, vbp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
-            size_t f3a  = vid((int)t, i_int,     j_int,     sz);
-            size_t f3b  = vid((int)t, i_int - 1, j_int - 1, sz);
-            size_t f3c  = vid((int)t, i_int,     j_int - 1, sz);
-            size_t f3bp = f3b + dv;
-            auto va = fetch_fixed_pair(t, f3a);
-            auto vb = fetch_fixed_pair(t, f3b);
-            auto vbp = fetch_fixed_pair(t, f3bp);
-            auto vc = fetch_fixed_pair(t, f3c);
-            if (has_cp(cp_faces, f3a, f3bp, f3c)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
-                                                    vc.second, vbp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
-            size_t f6a  = vid((int)t, i_int,     j_int,     sz);
-            size_t f6b  = vid((int)t, i_int,     j_int + 1, sz);
-            size_t f6c  = vid((int)t, i_int + 1, j_int + 1, sz);
-            size_t f6bp = f6b + dv;
-            auto va = fetch_fixed_pair(t, f6a);
-            auto vb = fetch_fixed_pair(t, f6b);
-            auto vbp = fetch_fixed_pair(t, f6bp);
-            auto vc = fetch_fixed_pair(t, f6c);
-            if (has_cp(cp_faces, f6a, f6bp, f6c)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vbp.first, va.first,
-                                                    vc.second, vbp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-        }
-
-        if (t > 0) {
-          int i_int = (int)i;
-          int j_int = (int)j;
-          auto valid = [&](int x, int limit){ return x >= 0 && x < limit; };
-
-          if (valid(i_int - 1, (int)H) && valid(j_int - 1, (int)W)) {
-            size_t f3a  = vid((int)t,     i_int,     j_int,     sz);
-            size_t f3b  = vid((int)t - 1, i_int - 1, j_int - 1, sz);
-            size_t f3c  = vid((int)t,     i_int,     j_int - 1, sz);
-            size_t f3cp = f3c - dv;
-            auto va = fetch_fixed_pair(t, f3a);
-            auto vb = fetch_fixed_pair(t, f3b);
-            auto vc = fetch_fixed_pair(t, f3c);
-            auto vcp = fetch_fixed_pair(t, f3cp);
-            if (has_cp(cp_faces, f3a, f3c, f3cp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vc.first, va.first,
-                                                    vcp.second, vc.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int + 1, (int)H) && valid(j_int - 1, (int)W)) {
-            size_t f4a  = vid((int)t,     i_int,     j_int,     sz);
-            size_t f4b  = vid((int)t - 1, i_int,     j_int - 1, sz);
-            size_t f4c  = vid((int)t - 1, i_int + 1, j_int - 1, sz);
-            size_t f4bp = f4b + dv;
-            size_t f4cp = f4c + dv;
-            auto va = fetch_fixed_pair(t, f4a);
-            auto vb = fetch_fixed_pair(t, f4b);
-            auto vc = fetch_fixed_pair(t, f4c);
-            auto vbp = fetch_fixed_pair(t, f4bp);
-            auto vcp = fetch_fixed_pair(t, f4cp);
-            if (has_cp(cp_faces, f4a, f4bp, f4cp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
-                                                    vcp.second, vbp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-            if (has_cp(cp_faces, f4a, f4cp, f4b)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vb.first, vcp.first, va.first,
-                                                    vb.second, vcp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
-            size_t f5a  = vid((int)t,     i_int,     j_int,     sz);
-            size_t f5b  = vid((int)t - 1, i_int + 1, j_int,     sz);
-            size_t f5c  = vid((int)t - 1, i_int + 1, j_int + 1, sz);
-            size_t f5bp = f5b + dv;
-            size_t f5cp = f5c + dv;
-            auto va = fetch_fixed_pair(t, f5a);
-            auto vb = fetch_fixed_pair(t, f5b);
-            auto vc = fetch_fixed_pair(t, f5c);
-            auto vbp = fetch_fixed_pair(t, f5bp);
-            auto vcp = fetch_fixed_pair(t, f5cp);
-            if (has_cp(cp_faces, f5a, f5bp, f5cp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vcp.first, vbp.first, va.first,
-                                                    vcp.second, vbp.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-            if (has_cp(cp_faces, f5a, f5c, f5bp)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vbp.first, vc.first, va.first,
-                                                    vbp.second, vc.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-
-          if (valid(i_int + 1, (int)H) && valid(j_int + 1, (int)W)) {
-            size_t f6a  = vid((int)t,     i_int,     j_int,     sz);
-            size_t f6b  = vid((int)t,     i_int,     j_int + 1, sz);
-            size_t f6c  = vid((int)t - 1, i_int + 1, j_int + 1, sz);
-            auto va = fetch_fixed_pair(t, f6a);
-            auto vb = fetch_fixed_pair(t, f6b);
-            auto vc = fetch_fixed_pair(t, f6c);
-            if (has_cp(cp_faces, f6a, f6b, f6c)) required_eb = 0;
-            {
-              T eb = derive_cp_abs_eb_sos_online<T>(vc.first, vb.first, va.first,
-                                                    vc.second, vb.second, va.second);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-        }
+        T required_eb = required_eb_layer[off];
 
         T abs_eb = required_eb;
         int id = eb_exponential_quantize(abs_eb, base, log_of_base, threshold);
