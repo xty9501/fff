@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "sz_def.hpp"
+#include "sz_decompression_utils.hpp"
 
 namespace cpsz {
 

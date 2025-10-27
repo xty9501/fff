@@ -21,9 +21,6 @@ template unsigned char* sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cp
 template unsigned char* sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_3DL_AR2<float>(
     const float*, const float*, size_t, size_t, size_t, size_t&, double, EbMode);
 
-template unsigned char* sz_compress_cp_preserve_sos_2p5d_online_fp_streaming<float>(
-    const float*, const float*, size_t, size_t, size_t, size_t&, double, EbMode);
-
 template unsigned char* sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop<float>(
     const float*, const float*, size_t, size_t, size_t, size_t&, double, EbMode);
 

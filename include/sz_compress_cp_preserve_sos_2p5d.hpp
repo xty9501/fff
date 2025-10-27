@@ -1,11 +1,16 @@
 #pragma once
 
 #include "sz_cp_preserve_sos_2p5d_common.hpp"
+#include "sz_compress_cp_preserve_2d.hpp"
 #include "sz_compression_utils.hpp"
 #include "sz_def.hpp"
 #include "sz_prediction.hpp"
 #include "sz_lossless.hpp"
 #include "utils.hpp"
+#include <chrono>
+
+#include <array>
+#include <unordered_set>
 
 #ifndef ZSTD_DETAIL
 #define ZSTD_DETAIL 1
@@ -38,7 +43,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
 
   // 2) 预计算：全局 CP 面集合（一次性）
   auto pre_compute_time = std::chrono::high_resolution_clock::now();
-  auto cp_faces = compute_cp_2p5d_faces<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  auto cp_faces = compute_cp_2p5d_faces_new<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt); //compute_cp_2p5d_faces_new: ftk version
   auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
 
 
@@ -83,6 +88,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
             << std::endl;
   std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
 
   // 3) 量化/编码缓冲
   int* eb_quant_index  = (int*)std::malloc(N*sizeof(int));
@@ -188,7 +194,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
           }
         }
         
-        // (B1) 侧面 [t, t+1]
+        // (B1) 侧面 [t, t+1] 
+        // FTK version
         if (t < (int)Tt-1){
           for (int k=0; k<6; ++k){
             int ni=i+di[k], nj=j+dj[k];
@@ -196,8 +203,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             size_t a  = vid(t, i, j, sz);
             size_t b  = vid(t, ni,nj, sz);
             size_t ap = a + dv, bp = b + dv;
-            if (k == 0 || k==3 || k==5){
-              // (a,b,bp) for k = 0,3,5
+            if (k == 0 || k==2 || k==4){
+              // (a,b,bp) for k = 0,2,4
               #if CP_DEBUG_VISIT
               MARK_FACE(a,b,bp);
               #endif
@@ -207,7 +214,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
                                                         V_fp[bp],V_fp[b],V_fp[a]);
                   if (eb < required_eb) required_eb = eb;
                 }
-              // (a,bp,ap) for k = 0,3,5
+              // (a,bp,ap) for k = 0,2,4
               #if CP_DEBUG_VISIT
               MARK_FACE(a,bp,ap);
               #endif
@@ -219,7 +226,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
                 }
             }
             else{
-              // (a,b,ap) for k = 1,2,4
+              // (a,b,ap) for k = 1,3,5
               #if CP_DEBUG_VISIT
               MARK_FACE(a,b,ap);
               #endif
@@ -229,20 +236,12 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
                                                         V_fp[ap],V_fp[b],V_fp[a]);
                   if (eb < required_eb) required_eb = eb;
                 }
-              // (b,ap,bp) for k = 1,2,4 //好像与点无关
-              // if (has_cp(cp_faces, b,ap,bp)) { required_eb = 0; goto after_min_eb; }
-              //   {
-              //     T eb = derive_cp_abs_eb_sos_online<T>(U_fp[b],U_fp[ap],U_fp[bp],
-              //                                           V_fp[b],V_fp[ap],V_fp[bp]);
-              //     if (eb <= degenerate_lsb){ degenerate_face = true; goto after_min_eb; }
-              //     if (eb < required_eb) required_eb = eb;
-              //   }
             }
-
           }
         }
 
         // (B2) 侧面 [t-1, t]
+        // FTK version
         if (t > 0){
           for (int k=0; k<6 ; ++k){
             int ni = i + di[k], nj = j + dj[k];
@@ -250,8 +249,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             size_t a = vid(t,i,j,sz); //v
             size_t b = vid(t,ni,nj,sz);
             size_t ap = a - dv, bp = b - dv; //ap,bp为上一层
-            if (k == 0 || k==3 || k==5){
-              // (a,b,ap) for k = 0,3,5
+            if (k == 0 || k==2 || k==4){
+              // (a,b,ap) for k = 0,2,4
               #if CP_DEBUG_VISIT
               MARK_FACE(a,b,ap);
               #endif
@@ -263,7 +262,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
                 }
             }
             else{
-              // (a,b,bp) for k = 1,2,4 //侧面上三角
+              // (a,b,bp) for k = 1,3,5 //侧面上三角
               #if CP_DEBUG_VISIT
               MARK_FACE(a,b,bp);
               #endif
@@ -274,7 +273,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
                   if (eb < required_eb) required_eb = eb;
                 }
                 
-              // (a,ap,bp) for k = 1,2,4 //侧面下三角
+              // (a,ap,bp) for k = 1,3,5 //侧面下三角
               #if CP_DEBUG_VISIT
               MARK_FACE(a,ap,bp);
               #endif
@@ -302,100 +301,97 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
           //     |/T2|/   |
           //     |---|----|
       
-          //triange 1 [x,y,t] = [(0,0,0),(1,0,0),(0,-1,0)]: has 2 faces
+          //triange 1 have 1 face FTK version
           size_t f1a = vid(t,  i,  j,  sz);
           size_t f1b = vid(t,  i,j+1,  sz);
           size_t f1c = vid(t,  i-1,j,  sz);
           size_t f1ap = f1a + dv, f1bp = f1b + dv, f1cp = f1c + dv;
           if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
-            // (f1a,f1cp,f1b)
+            // (f1a,f1bp,f1c)
             #if CP_DEBUG_VISIT
-            MARK_FACE(f1a,f1cp,f1b);
+            MARK_FACE(f1a,f1bp,f1c);
             #endif
-            if (has_cp(cp_faces, f1a,f1cp,f1b)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1b],U_fp[f1cp],U_fp[f1a],
-                                                    V_fp[f1b],V_fp[f1cp],V_fp[f1a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-            // (f1a,f1cp,f1bp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f1a,f1cp,f1bp);
-            #endif
-            if (has_cp(cp_faces, f1a,f1cp,f1bp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1cp],U_fp[f1a],
-                                                    V_fp[f1bp],V_fp[f1cp],V_fp[f1a]);
+            if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1c],U_fp[f1bp],U_fp[f1a],
+                                                    V_fp[f1c],V_fp[f1bp],V_fp[f1a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
 
-          //triange 2 [x,y,t] = [(0,0,0),(0,-1,0),(-1,-1,0)]: has 2 faces
-          size_t f2a = vid(t,  i,  j,  sz);
-          size_t f2b = vid(t,  i-1,j,  sz);
-          size_t f2c = vid(t,  i-1,j-1,sz);
-          size_t f2ap = f2a + dv, f2bp = f2b + dv, f2cp = f2c + dv;
-          if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-            // (f2a,f2c,f2bp)
+          //triange 2 has 0 face FTK version
+          // triange 3 has 0 face FTK version
+          // triange 4 has 1 face FTK version
+          size_t f4a = vid(t,  i,  j,  sz);
+          size_t f4b = vid(t,  i,j - 1,  sz);
+          size_t f4c = vid(t,  i+1,j,sz);
+          size_t f4ap = f4a + dv, f4bp = f4b + dv, f4cp = f4c + dv;
+          if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+            // (f4a,f4b,f4cp)
             #if CP_DEBUG_VISIT
-            MARK_FACE(f2a,f2c,f2bp);
+            MARK_FACE(f4a,f4b,f4cp);
             #endif
-            if (has_cp(cp_faces, f2a,f2c,f2bp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2c],U_fp[f2a],
-                                                    V_fp[f2bp],V_fp[f2c],V_fp[f2a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-            // (f2a,f2bp,f2cp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f2a,f2bp,f2cp);
-            #endif
-            if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2cp],U_fp[f2bp],U_fp[f2a],
-                                                    V_fp[f2cp],V_fp[f2bp],V_fp[f2a]);
+            if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
+                                                    V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
 
-          // triange 3 [x,y,t] = [(0,0,0),(-1,-1,0),(-1,0,0)]: has 1 faces
-          size_t f3a = vid(t,  i,  j,  sz);
-          size_t f3b = vid(t,  i-1,j-1,sz);
-          size_t f3c = vid(t,  i,j-1,  sz);
-          size_t f3ap = f3a + dv, f3bp = f3b + dv, f3cp = f3c + dv;
-          if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-            // (f3a,f3bp,f3c)
+          // triange 5 2 faces FTK version
+          size_t f5a = vid(t,  i,  j,  sz);
+          size_t f5b = vid(t,  i+1,j,  sz);
+          size_t f5c = vid(t,  i+1,j+1,sz);
+          size_t f5ap = f5a + dv, f5bp = f5b + dv, f5cp = f5c + dv;
+          if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+            // (f5a,f5bp,f5cp)
             #if CP_DEBUG_VISIT
-            MARK_FACE(f3a,f3bp,f3c);
+            MARK_FACE(f5a,f5bp,f5cp);
             #endif
-            if (has_cp(cp_faces, f3a,f3bp,f3c)) {
-              required_eb=0;
+            if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
+                                                    V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
+              if (eb < required_eb) required_eb = eb;
             }
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3c],U_fp[f3bp],U_fp[f3a],
-                                                    V_fp[f3c],V_fp[f3bp],V_fp[f3a]);
+            // (f5a,f5b,f5cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f5a,f5b,f5cp);
+            #endif
+            if (has_cp(cp_faces, f5a,f5b,f5cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5b],U_fp[f5a],
+                                                    V_fp[f5cp],V_fp[f5b],V_fp[f5a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
-          // triange 4 0 faces
-          // triange 5 0 faces
-          // triange 6 [x,y,t] = [(0,0,0),(1,0,0),(1,1,0)]: has 1 faces
+          // triange 6 has 2 faces FTK version
           size_t f6a = vid(t,  i,  j,  sz);
-          size_t f6b = vid(t,  i,j+1,  sz);
-          size_t f6c = vid(t,  i+1,j+1,sz);
+          size_t f6b = vid(t,  i+1,j+1,sz);
+          size_t f6c = vid(t,  i,j+1,  sz);
           size_t f6ap = f6a + dv, f6bp = f6b + dv, f6cp = f6c + dv;
           if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
             // (f6a,f6bp,f6c)
             #if CP_DEBUG_VISIT
             MARK_FACE(f6a,f6bp,f6c);
             #endif
-            if (has_cp(cp_faces, f6a,f6bp,f6c)) {
-              required_eb=0; 
-            }
+            if (has_cp(cp_faces, f6a,f6bp,f6c)) { required_eb=0;}
             { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6c],U_fp[f6bp],U_fp[f6a],
                                                     V_fp[f6c],V_fp[f6bp],V_fp[f6a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f6a,f6bp,f6cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f6a,f6bp,f6cp);
+            #endif
+            if (has_cp(cp_faces, f6a,f6bp,f6cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6bp],U_fp[f6a],
+                                                    V_fp[f6cp],V_fp[f6bp],V_fp[f6a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
         }
 
 
-        // (C2) [t-1, t] 内部剖分面 并不与C1对称
+        // (C2) [t-1, t] 内部剖分面 并不与C1对称\
+        // FTK version
         if (t > 0){
           //     ---------
           //     |  /| T5/|
@@ -407,104 +403,94 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
           //     |/T2|/   |
           //     |---|----|
 
-          //triange 1 0 face
-          //triange 2 0 face
-          //triange 3  has 1 faces
+          //triange 1 have 1 face FTK version
+          size_t f1a = vid(t, i,  j,  sz);
+          size_t f1b = vid(t, i-1, j, sz);
+          size_t f1c = vid(t, i, j+1, sz);
+          size_t f1ap = f1a - dv, f1bp = f1b - dv, f1cp = f1c - dv;
+          if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f1a,f1bp,f1c);
+            #endif
+            if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1c],U_fp[f1a],
+                                                    V_fp[f1bp],V_fp[f1c],V_fp[f1a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            
+          }
+          //triange 2 has 2 faces FTK version
+          size_t f2a = vid(t, i,  j,  sz);
+          size_t f2b = vid(t, i-1,j,  sz);
+          size_t f2c = vid(t, i-1,j-1,sz);
+          size_t f2ap = f2a - dv, f2bp = f2b - dv, f2cp = f2c - dv;
+          if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+            // (f2a,f2bp,f2cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f2a,f2bp,f2cp);
+            #endif
+            if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2cp],U_fp[f2a],
+                                                    V_fp[f2bp],V_fp[f2cp],V_fp[f2a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f2a,f2b,f2cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f2a,f2b,f2cp);
+            #endif
+            if (has_cp(cp_faces, f2a,f2b,f2cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2b],U_fp[f2cp],U_fp[f2a],
+                                                    V_fp[f2b],V_fp[f2cp],V_fp[f2a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          //triange 3  has 2 faces FTK version
           size_t f3a = vid(t, i,  j,  sz);   
           size_t f3b = vid(t, i-1,j-1,sz);
           size_t f3c = vid(t, i,j-1,  sz);
           size_t f3ap = f3a - dv, f3bp = f3b - dv, f3cp = f3c - dv;
           if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-            // (f3a,f3b,f3cp)
+            // (f3a,f3bp,f3cp)
             #if CP_DEBUG_VISIT
-            MARK_FACE(f3a,f3b,f3cp);
+            MARK_FACE(f3a,f3bp,f3cp);
             #endif
-            if (has_cp(cp_faces, f3a,f3b,f3cp)) {
-              required_eb=0;
+            if (has_cp(cp_faces, f3a,f3bp,f3cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3cp],U_fp[f3a],
+                                                    V_fp[f3bp],V_fp[f3cp],V_fp[f3a]);
+              if (eb < required_eb) required_eb = eb;
             }
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3cp],U_fp[f3b],U_fp[f3a],
-                                                    V_fp[f3cp],V_fp[f3b],V_fp[f3a]);
+            // (f3a,f3bp,f3c)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f3a,f3bp,f3c);
+            #endif
+            if (has_cp(cp_faces, f3a,f3bp,f3c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3c],U_fp[f3a],
+                                                    V_fp[f3bp],V_fp[f3c],V_fp[f3a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
-          //triange 4 has 2 faces
+
+          //triange 4 has 1 face FTK version
           size_t f4a = vid(t, i,  j,  sz);
           size_t f4b = vid(t, i,j-1,  sz);
           size_t f4c = vid(t,i+1,j,  sz);
           size_t f4ap = f4a - dv, f4bp = f4b - dv, f4cp = f4c - dv;
           if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
-            // (f4a,f4bp,f4cp)
+            // (f4a,f4bp,f4c)
             #if CP_DEBUG_VISIT
-            MARK_FACE(f4a,f4bp,f4cp);
+            MARK_FACE(f4a,f4bp,f4c);
             #endif
-            if (has_cp(cp_faces, f4a,f4bp,f4cp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4bp],U_fp[f4a],
-                                                    V_fp[f4cp],V_fp[f4bp],V_fp[f4a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-            // (f4a,f4b,f4cp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f4a,f4b,f4cp);
-            #endif
-            if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
-                                                    V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
+            if (has_cp(cp_faces, f4a,f4bp,f4c)) { required_eb=0; }
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4c],U_fp[f4bp],U_fp[f4a],
+                                                    V_fp[f4c],V_fp[f4bp],V_fp[f4a]);
               if (eb < required_eb) required_eb = eb;
             }
           }
-          //triange 5 has 2 faces
-          size_t f5a = vid(t, i,  j,  sz);
-          size_t f5b = vid(t, i+1,j,  sz);
-          size_t f5c = vid(t, i+1,j+1,sz);
-          size_t f5ap = f5a - dv, f5bp = f5b - dv, f5cp = f5c - dv;
-          if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
-            // (f5a,f5bp,f5cp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f5a,f5bp,f5cp);
-            #endif
-            if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0; }
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
-                                                    V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-            // (f5a,f5c,f5bp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f5a,f5c,f5bp);
-            #endif
-            if (has_cp(cp_faces, f5a,f5c,f5bp)) { required_eb=0;}
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5bp],U_fp[f5c],U_fp[f5a],
-                                                    V_fp[f5bp],V_fp[f5c],V_fp[f5a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
-          //triange 6 has 1 faces
-          size_t f6a = vid(t, i,  j,  sz);
-          size_t f6b = vid(t, i,j+1,  sz);
-          size_t f6c = vid(t, i+1,j+1,sz);
-          size_t f6ap = f6a - dv, f6bp = f6b - dv, f6cp = f6c - dv;
-          if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
-            // (f6a,f6b,f6cp)
-            #if CP_DEBUG_VISIT
-            MARK_FACE(f6a,f6b,f6cp);
-            #endif
-            if (has_cp(cp_faces, f6a,f6b,f6cp)) {
-              required_eb=0;
-            }
-            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6b],U_fp[f6a],
-                                                    V_fp[f6cp],V_fp[f6b],V_fp[f6a]);
-              if (eb < required_eb) required_eb = eb;
-            }
-          }
+          //triange 5 has 0 face FTK version
+          //triange 6 has 0 faces FTK version
         }
-        // {
-        //   // 保证 |dec-orig| ≤ abs_eb < |orig| ⇒ 不会跨 0 翻符号
-        //   T sign_guard = std::min(std::llabs(curU_val), std::llabs(curV_val));
-        //   if (sign_guard > 0 && required_eb >= sign_guard){
-        //       T max_eb_to_preserve_sign = sign_guard - 1; // 留 1 LSB 余量
-        //       if (max_eb_to_preserve_sign < required_eb)
-        //           required_eb = max_eb_to_preserve_sign;
-        //   }
-        // }
+
         T abs_eb = required_eb;
         int id = eb_exponential_quantize(abs_eb,base,log_of_base,threshold);
         
@@ -573,11 +559,11 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
             *curV = dec[1];
 
             // 编码端自检（浮点域）
-            double abs_eb_fp = (double)abs_eb / (double)scale;
-            double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
-            double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
-            enc_max_abs_eb_fp   = std::max(enc_max_abs_eb_fp, abs_eb_fp);
-            enc_max_real_err_fp = std::max(enc_max_real_err_fp, std::max(err_u_fp, err_v_fp));
+            // double abs_eb_fp = (double)abs_eb / (double)scale;
+            // double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
+            // double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
+            // enc_max_abs_eb_fp   = std::max(enc_max_abs_eb_fp, abs_eb_fp);
+            // enc_max_real_err_fp = std::max(enc_max_real_err_fp, std::max(err_u_fp, err_v_fp));
           }
         }
       }
@@ -628,11 +614,11 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
   write_variable_to_dst(pos, unpred_cnt);
   if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
   // 打印求和
-  {
-      double unpred_sum = 0.0;
-      for (size_t i = 0; i < unpred_cnt; ++i) unpred_sum += unpred[i];
-      printf("unpred sum = %.6f\n", unpred_sum);
-  }
+  // {
+  //     double unpred_sum = 0.0;
+  //     for (size_t i = 0; i < unpred_cnt; ++i) unpred_sum += unpred[i];
+  //     printf("unpred sum = %.6f\n", unpred_sum);
+  // }
   #if ZSTD_DETAIL
   {
     // use zstd, calculate size after zstd
@@ -737,6 +723,1091 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap(
   return compressed;
 }
 
+
+// Parallel MOP encoder using inter-block wavefront scheduling
+// Note: we only append new code; no changes to existing functions.
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop_parallel(
+    const T_data* U, const T_data* V,
+    size_t r1, size_t r2, size_t r3,
+    size_t& compressed_size,
+    double max_pwr_eb,
+    EbMode mode)
+{
+  using T = int64_t;
+  const Size3 sz{ (int)r1,(int)r2,(int)r3 };
+  const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
+
+  // 1) Fixed-point conversion
+  T *U_fp = (T*)std::malloc(N*sizeof(T));
+  T *V_fp = (T*)std::malloc(N*sizeof(T));
+  if(!U_fp || !V_fp){ if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp); compressed_size=0; return nullptr; }
+  T range=0;
+  T scale = convert_to_fixed_point<T_data,T>(U, V, N, U_fp, V_fp, range);
+
+  // 2) Pre-compute global CP faces once (already parallelized inside)
+  auto pre_compute_time = std::chrono::high_resolution_clock::now();
+  auto cp_faces = compute_cp_2p5d_faces_new<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
+  std::cout << "pre-compute cp faces time second: "
+            << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
+            << std::endl;
+  std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
+  // 3) Quant buffers and stream containers
+  const int base = 2;
+  const int capacity = 65536;
+  const double log_of_base = log2(base);
+  const int intv_radius = (capacity >> 1);
+  const T threshold = 1; // eb LSB quant threshold
+
+  // error bound in fixed-point LSB
+  T max_eb = 0;
+  if (mode == EbMode::Relative){
+    max_eb = (T)std::llround((long double)max_pwr_eb * (long double)range);
+    printf("Compression Using Relative Eb Mode!\n");
+  } else if (mode == EbMode::Absolute){
+    max_eb = (T)std::llround((long double)max_pwr_eb * (long double)scale);
+    printf("Compression Using Absolute Eb Mode!\n");
+  } else {
+    std::cerr << "Error: Unsupported EbMode!\n";
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+
+  // block tiling & modes storage
+  const int BH = SZ_MOP_BH, BW = SZ_MOP_BW;
+  const int blocks_i = (int)((H + BH - 1) / BH);
+  const int blocks_j = (int)((W + BW - 1) / BW);
+  const size_t blocks_per_t = (size_t)blocks_i * (size_t)blocks_j;
+  std::vector<uint8_t> block_modes; block_modes.resize(Tt * blocks_per_t, (uint8_t)PM::L3D);
+
+  // advection parameters (dataset specific temporary handling, kept consistent with original)
+  double dt_dx, dt_dy;
+  if (W == 640 && H == 80) { dt_dx = 0.8; dt_dy = 0.8; }
+  else if (W == 150 && H == 450) { dt_dx = 0.01 / 0.66666666; dt_dy = 0.01 / 0.66666666; }
+  else if (W == 450 && H == 200) { dt_dx = (4.428 / 499) / (10.0 / 450); dt_dy = (4.428 / 499) / (4.0 / 200); }
+  else if (W == 512 && H == 512) { dt_dx = (10.0 / 1000.0) / ( 1.0 / 512.0); dt_dy = (10.0 / 1000.0) / ( 1.0 / 512.0); }
+  else { std::cout << "Please provide dt/dx and dt/dy for this dataset!" << std::endl; std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr; }
+
+  const size_t plane = (size_t)H * (size_t)W;
+  const ptrdiff_t si=(ptrdiff_t)W, sj=(ptrdiff_t)1, sk=(ptrdiff_t)(H*W);
+  const size_t dv = (size_t)H*(size_t)W;
+  const int di6[6] = { 0,  0,  1, -1,  1, -1 };
+  const int dj6[6] = { 1, -1,  0,  0,  1, -1 };
+
+  // global output streams (in decoder-consistent order)
+  std::vector<int> eb_stream; eb_stream.reserve(N);
+  std::vector<int> dq_stream; dq_stream.reserve(2*N);
+  std::vector<T_data> unpred; unpred.reserve((N/4)*2);
+
+  // set global params for advect in the calling thread; threads will set again locally (thread-local ctx)
+  pred_advect_set_params((int)H, (int)W, dt_dx, dt_dy, (int64_t)scale, /*max_disp*/-1.0);
+
+  for (int t=0; t<(int)Tt; ++t){
+    if (t % 100 == 0) printf("processing slice %d / %d\n", t, (int)Tt);
+
+    // 3.1 choose predictor per block (parallel across blocks)
+    {
+      // Each thread must configure its thread-local advect params
+      #ifdef _OPENMP
+      #pragma omp parallel for collapse(2) schedule(static)
+      #endif
+      for (int bi=0; bi<(int)H; bi+=BH){
+        for (int bj=0; bj<(int)W; bj+=BW){
+          // thread-local advect ctx setup
+          pred_advect_set_params((int)H, (int)W, dt_dx, dt_dy, (int64_t)scale, /*max_disp*/-1.0);
+          PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample(
+              U_fp, V_fp,
+              (int)H,(int)W, t,
+              bi,bj, BH,BW,
+              si,sj,sk,
+              /*eb_lsb_cap=*/ std::max<T>(1, max_eb),
+              /*intv_radius=*/ intv_radius,
+              /*capacity=*/ capacity,
+              /*subs=*/ SZ_MOP_EVAL_SUBS);
+          const int b_i = bi / BH, b_j = bj / BW;
+          block_modes[(size_t)t*blocks_per_t + (size_t)b_i*blocks_j + (size_t)b_j] = (uint8_t)pm;
+        }
+      }
+    }
+
+    // 3.2 per-block streams for this t, to preserve output order
+    struct BlockOut { std::vector<int> eb; std::vector<int> dq; std::vector<T_data> unp; };
+    std::vector<BlockOut> layer_blocks(blocks_per_t);
+
+    // bind prev UV plane for advect in each thread before doing blocks
+    // wavefront across blocks: sum = b_i + b_j
+    const int max_diag = (blocks_i - 1) + (blocks_j - 1);
+    for (int diag=0; diag<=max_diag; ++diag){
+      #ifdef _OPENMP
+      #pragma omp parallel for schedule(static)
+      #endif
+      for (int b_i=0; b_i<blocks_i; ++b_i){
+        int b_j = diag - b_i; if (b_j < 0 || b_j >= blocks_j) continue;
+        const int bi = b_i * BH;
+        const int bj = b_j * BW;
+        const int i_end = std::min(bi+BH, (int)H);
+        const int j_end = std::min(bj+BW, (int)W);
+
+        // thread-local advect ctx
+        pred_advect_set_params((int)H, (int)W, dt_dx, dt_dy, (int64_t)scale, /*max_disp*/-1.0);
+        if (t >= 1) {
+          const int64_t* u_prev_plane = (const int64_t*)(U_fp + (size_t)(t-1)*plane);
+          const int64_t* v_prev_plane = (const int64_t*)(V_fp + (size_t)(t-1)*plane);
+          pred_advect_bind_prev_uv(u_prev_plane, v_prev_plane, /*si_uv=*/si, /*sj_uv=*/sj);
+        } else {
+          pred_advect_bind_prev_uv(nullptr, nullptr, 0, 0);
+        }
+
+        const PM pm = (PM)block_modes[(size_t)t*blocks_per_t + (size_t)b_i*blocks_j + (size_t)b_j];
+        BlockOut local; local.eb.reserve((size_t)(i_end-bi)*(size_t)(j_end-bj)); local.dq.reserve((size_t)(i_end-bi)*(size_t)(j_end-bj)*2);
+
+        for (int i=bi; i<i_end; ++i){
+          for (int j=bj; j<j_end; ++j){
+            const size_t v = (size_t)t*H*W + (size_t)i*W + (size_t)j;
+            T *curU = U_fp + v;
+            T *curV = V_fp + v;
+            const T curU_val = *curU;
+            const T curV_val = *curV;
+
+            // derive required eb by enumerating related faces (same as sequential MOP)
+            T required_eb = max_eb;
+            // (A) intra-layer faces within [i-1..i, j-1..j]
+            for (int ci=i-1; ci<=i; ++ci){
+              if (!in_range(ci, (int)H-1)) continue;
+              for (int cj=j-1; cj<=j; ++cj){
+                if (!in_range(cj, (int)W-1)) continue;
+
+                size_t v00 = vid(t,ci,  cj,  sz);
+                size_t v10 = vid(t,ci,  cj+1,sz);
+                size_t v01 = vid(t,ci+1,cj,  sz);
+                size_t v11 = vid(t,ci+1,cj+1,sz);
+
+                // Upper: (v00,v01,v11)
+                if (v==v00 || v==v01 || v==v11){
+                  if (has_cp(cp_faces, v00,v01,v11)) { required_eb = 0; }
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v11],U_fp[v01],U_fp[v00],
+                                                        V_fp[v11],V_fp[v01],V_fp[v00]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+                // Lower: (v00,v10,v11)
+                if (v==v00 || v==v10 || v==v11){
+                  if (has_cp(cp_faces, v00,v10,v11)) { required_eb = 0; }
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v11],U_fp[v10],U_fp[v00],
+                                                        V_fp[v11],V_fp[v10],V_fp[v00]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+              }
+            }
+
+            // (B1) side faces [t, t+1]
+            if (t < (int)Tt-1){
+              for (int k=0; k<6; ++k){
+                int ni=i+di6[k], nj=j+dj6[k];
+                if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+                size_t a  = vid(t, i, j, sz);
+                size_t b  = vid(t, ni,nj, sz);
+                size_t ap = a + dv, bp = b + dv;
+                if (k == 0 || k==2 || k==4){
+                  if (has_cp(cp_faces, a,b,bp)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[b],U_fp[a],
+                                                          V_fp[bp],V_fp[b],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                  if (has_cp(cp_faces, a,bp,ap)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[bp],U_fp[a],
+                                                          V_fp[ap],V_fp[bp],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                } else {
+                  if (has_cp(cp_faces, a,b,ap)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[b],U_fp[a],
+                                                          V_fp[ap],V_fp[b],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                }
+              }
+            }
+
+            // (B2) side faces [t-1, t]
+            if (t > 0){
+              for (int k=0; k<6 ; ++k){
+                int ni = i + di6[k], nj = j + dj6[k];
+                if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+                size_t a = vid(t,i,j,sz);
+                size_t b = vid(t,ni,nj,sz);
+                size_t ap = a - dv, bp = b - dv;
+                if (k == 0 || k==2 || k==4){
+                  if (has_cp(cp_faces, a,b,ap)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[b],U_fp[a],
+                                                          V_fp[ap],V_fp[b],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                } else {
+                  if (has_cp(cp_faces, a,b,bp)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[b],U_fp[a],
+                                                          V_fp[bp],V_fp[b],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                  if (has_cp(cp_faces, a,ap,bp)) { required_eb = 0; }
+                  { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[ap],U_fp[a],
+                                                          V_fp[bp],V_fp[ap],V_fp[a]);
+                    if (eb < required_eb) required_eb = eb; }
+                }
+              }
+            }
+
+            // (C1) internal split faces [t, t+1]
+            if (t < (int)Tt-1){
+              size_t f1a = vid(t,  i,  j,  sz);
+              size_t f1b = vid(t,  i,j+1,  sz);
+              size_t f1c = vid(t,  i-1,j,  sz);
+              size_t f1ap = f1a + dv, f1bp = f1b + dv, f1cp = f1c + dv;
+              if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+                if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1c],U_fp[f1bp],U_fp[f1a],
+                                                        V_fp[f1c],V_fp[f1bp],V_fp[f1a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f4a = vid(t,  i,  j,  sz);
+              size_t f4b = vid(t,  i,j - 1,  sz);
+              size_t f4c = vid(t,  i+1,j,sz);
+              size_t f4ap = f4a + dv, f4bp = f4b + dv, f4cp = f4c + dv;
+              if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+                if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
+                                                        V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f5a = vid(t,  i,  j,  sz);
+              size_t f5b = vid(t,  i+1,j,  sz);
+              size_t f5c = vid(t,  i+1,j+1,sz);
+              size_t f5ap = f5a + dv, f5bp = f5b + dv, f5cp = f5c + dv;
+              if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+                if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
+                                                        V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
+                  if (eb < required_eb) required_eb = eb; }
+                if (has_cp(cp_faces, f5a,f5b,f5cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5b],U_fp[f5a],
+                                                        V_fp[f5cp],V_fp[f5b],V_fp[f5a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f6a = vid(t,  i,  j,  sz);
+              size_t f6b = vid(t,  i+1,j+1,sz);
+              size_t f6c = vid(t,  i,j+1,  sz);
+              size_t f6ap = f6a + dv, f6bp = f6b + dv, f6cp = f6c + dv;
+              if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+                if (has_cp(cp_faces, f6a,f6bp,f6c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6c],U_fp[f6bp],U_fp[f6a],
+                                                        V_fp[f6c],V_fp[f6bp],V_fp[f6a]);
+                  if (eb < required_eb) required_eb = eb; }
+                if (has_cp(cp_faces, f6a,f6bp,f6cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6bp],U_fp[f6a],
+                                                        V_fp[f6cp],V_fp[f6bp],V_fp[f6a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+            }
+
+            // (C2) internal split faces [t-1, t]
+            if (t > 0){
+              size_t f1a = vid(t, i,  j,  sz);
+              size_t f1b = vid(t, i-1, j, sz);
+              size_t f1c = vid(t, i, j+1, sz);
+              size_t f1ap = f1a - dv, f1bp = f1b - dv, f1cp = f1c - dv;
+              if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+                if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1c],U_fp[f1a],
+                                                        V_fp[f1bp],V_fp[f1c],V_fp[f1a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f2a = vid(t, i,  j,  sz);
+              size_t f2b = vid(t, i-1,j,  sz);
+              size_t f2c = vid(t, i-1,j-1,sz);
+              size_t f2ap = f2a - dv, f2bp = f2b - dv, f2cp = f2c - dv;
+              if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+                if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2cp],U_fp[f2a],
+                                                        V_fp[f2bp],V_fp[f2cp],V_fp[f2a]);
+                  if (eb < required_eb) required_eb = eb; }
+                if (has_cp(cp_faces, f2a,f2b,f2cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2b],U_fp[f2cp],U_fp[f2a],
+                                                        V_fp[f2b],V_fp[f2cp],V_fp[f2a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f3a = vid(t, i,  j,  sz);
+              size_t f3b = vid(t, i-1,j-1,sz);
+              size_t f3c = vid(t, i,j-1,  sz);
+              size_t f3ap = f3a - dv, f3bp = f3b - dv, f3cp = f3c - dv;
+              if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+                if (has_cp(cp_faces, f3a,f3bp,f3cp)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3cp],U_fp[f3a],
+                                                        V_fp[f3bp],V_fp[f3cp],V_fp[f3a]);
+                  if (eb < required_eb) required_eb = eb; }
+                if (has_cp(cp_faces, f3a,f3bp,f3c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3c],U_fp[f3a],
+                                                        V_fp[f3bp],V_fp[f3c],V_fp[f3a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+
+              size_t f4a = vid(t, i,  j,  sz);
+              size_t f4b = vid(t, i,j-1,  sz);
+              size_t f4c = vid(t,i+1,j,  sz);
+              size_t f4ap = f4a - dv, f4bp = f4b - dv, f4cp = f4c - dv;
+              if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+                if (has_cp(cp_faces, f4a,f4bp,f4c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4c],U_fp[f4bp],U_fp[f4a],
+                                                        V_fp[f4c],V_fp[f4bp],V_fp[f4a]);
+                  if (eb < required_eb) required_eb = eb; }
+              }
+            }
+
+            // eb quantization id
+            T abs_eb = required_eb;
+            int id = eb_exponential_quantize(abs_eb, base, log_of_base, threshold);
+
+            if (abs_eb == 0){
+              local.eb.push_back(0);
+              local.unp.push_back(U[v]);
+              local.unp.push_back(V[v]);
+              // keep U_fp/V_fp as original for predictor consistency
+              continue;
+            }
+
+            {
+              bool unpred_flag=false;
+              T dec[2];
+              for (int p=0; p<2; ++p){
+                T *cur  = (p==0)? curU : curV;
+                T  curv = (p==0) ? curU_val : curV_val;
+
+                T pred = predict_dispatch(pm, cur, t, i, j, si, sj, sk);
+                T diff = curv - pred;
+                T qd = (std::llabs(diff)/abs_eb) + 1;
+                if (qd < capacity){
+                  qd = (diff > 0) ? qd : -qd;
+                  int qindex = (int)(qd/2) + intv_radius;
+                  local.dq.push_back(qindex);
+                  dec[p] = pred + 2*(qindex - intv_radius)*abs_eb;
+                  if (std::llabs(dec[p] - curv) > abs_eb){ unpred_flag = true; }
+                } else {
+                  unpred_flag = true;
+                }
+                if (unpred_flag) break;
+              }
+
+              if (unpred_flag){
+                local.eb.push_back(0);
+                // pop any half-written dq entry in this pixel
+                if (!local.dq.empty() && (local.dq.size() & 1)) local.dq.pop_back();
+                local.unp.push_back(U[v]); local.unp.push_back(V[v]);
+              } else {
+                local.eb.push_back(id);
+                *curU = dec[0]; *curV = dec[1];
+              }
+            }
+          } // j
+        } // i
+
+        // store per-block output
+        layer_blocks[(size_t)b_i*(size_t)blocks_j + (size_t)b_j] = std::move(local);
+      } // for b_i within diag
+    } // for diag
+
+    // 3.3 append to global streams in decoder-consistent order (bi -> bj)
+    for (int bi=0; bi<(int)H; bi+=BH){
+      const int b_i = bi / BH;
+      for (int bj=0; bj<(int)W; bj+=BW){
+        const int b_j = bj / BW;
+        const BlockOut& blk = layer_blocks[(size_t)b_i*(size_t)blocks_j + (size_t)b_j];
+        eb_stream.insert(eb_stream.end(), blk.eb.begin(), blk.eb.end());
+        dq_stream.insert(dq_stream.end(), blk.dq.begin(), blk.dq.end());
+        unpred.insert(unpred.end(), blk.unp.begin(), blk.unp.end());
+      }
+    }
+  } // for t
+
+  // 4) pack bitstream (same layout as mop encoder)
+  std::vector<uint8_t> pm_bytes;
+  pack_modes_1bit(block_modes, pm_bytes);
+  print_mode_counts(block_modes);
+
+  unsigned char *compressed = (unsigned char*)std::malloc( (size_t)(2*N*sizeof(T)) );
+  unsigned char *pos = compressed;
+
+  write_variable_to_dst(pos, scale);
+  write_variable_to_dst(pos, base);
+  write_variable_to_dst(pos, threshold);
+  write_variable_to_dst(pos, intv_radius);
+
+  const char MOP2_MAGIC[4] = {'M','O','P','2'};
+  write_array_to_dst(pos, MOP2_MAGIC, 4);
+  uint32_t bh=BH, bw=BW, bi_cnt=blocks_i, bj_cnt=blocks_j;
+  write_variable_to_dst(pos, bh);
+  write_variable_to_dst(pos, bw);
+  write_variable_to_dst(pos, bi_cnt);
+  write_variable_to_dst(pos, bj_cnt);
+  uint64_t pm_len = (uint64_t)pm_bytes.size();
+  write_variable_to_dst(pos, pm_len);
+  if (pm_len) write_array_to_dst(pos, pm_bytes.data(), (size_t)pm_len);
+
+  size_t unpred_cnt = unpred.size();
+  write_variable_to_dst(pos, unpred_cnt);
+  if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
+
+  // eb stream
+  if (eb_stream.size() != N){
+    std::cerr << "[parallel mop] eb_stream size mismatch: " << eb_stream.size() << " vs N=" << N << "\n";
+    std::free(U_fp); std::free(V_fp); std::free(compressed); compressed_size=0; return nullptr;
+  }
+  size_t eb_quant_num = eb_stream.size();
+  write_variable_to_dst(pos, eb_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_stream.data(), eb_quant_num, pos);
+
+  // dq stream
+  size_t data_quant_num = dq_stream.size();
+  write_variable_to_dst(pos, data_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*capacity, dq_stream.data(), data_quant_num, pos);
+
+  compressed_size = (size_t)(pos - compressed);
+  std::free(U_fp); std::free(V_fp);
+  return compressed;
+}
+
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_sl(
+    const T_data* U, const T_data* V,
+    size_t r1, size_t r2, size_t r3,   // r1=H, r2=W, r3=T (时间最慢)
+    size_t& compressed_size,
+    double max_pwr_eb,                  // 全局绝对误差上限（浮点域）：max_eb(fp)=max_pwr_eb
+    EbMode mode,
+    double dt_dx,
+    double dt_dy
+){
+  using T = int64_t;
+  const Size3 sz{ (int)r1,(int)r2,(int)r3 };
+  const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
+
+  // 1) 定点化（先乘后 llround）
+  T *U_fp=(T*)std::malloc(N*sizeof(T));
+  T *V_fp=(T*)std::malloc(N*sizeof(T));
+  if(!U_fp || !V_fp){
+    if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp);
+    compressed_size=0; return nullptr;
+  }
+  T range=0;
+  T scale = convert_to_fixed_point<T_data,T>(U, V, N, U_fp, V_fp, range);
+
+  // 2) 预计算：全局 CP 面集合（一次性）
+  auto pre_compute_time = std::chrono::high_resolution_clock::now();
+  auto cp_faces = compute_cp_2p5d_faces_new<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
+
+
+  std::cout << "pre-compute cp faces time second: "
+            << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
+            << std::endl;
+  std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
+  // 3) 量化/编码缓冲
+  int* eb_quant_index  = (int*)std::malloc(N*sizeof(int));
+  int* data_quant_index= (int*)std::malloc(2*N*sizeof(int)); // U/V 交错
+  double enc_max_abs_eb_fp   = 0.0; //编码端自检（浮点）
+  double enc_max_real_err_fp = 0.0;
+  if(!eb_quant_index || !data_quant_index){
+    if(eb_quant_index) std::free(eb_quant_index);
+    if(data_quant_index) std::free(data_quant_index);
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+  int* eb_pos = eb_quant_index;
+  int* dq_pos = data_quant_index;
+  std::vector<T_data> unpred; unpred.reserve((N / 4) * 2);
+
+  // 参数与量化槽
+  const int base = 2;                             // 仍写头，方便向后兼容
+  const int capacity = 65536; //65536
+  const double log_of_base = log2(base);
+  const int intv_radius = (capacity >> 1);
+
+  // 把浮点域绝对误差上限转到定点域（LSB）
+  // const T max_eb = (T) std::llround( (long double)max_pwr_eb * (long double)scale );
+
+  T max_eb = 0;
+  if(mode == EbMode::Relative){
+
+    max_eb = max_pwr_eb * range; // 相对误差转绝对误差
+    printf("Compression Using Relative Eb Mode!\n");
+  }
+  else if (mode == EbMode::Absolute){
+    printf("Compression Using Absolute Eb Mode!\n");
+    max_eb = max_pwr_eb * scale; // 浮点→定点
+  }
+  else{
+    std::cerr << "Error: Unsupported EbMode!\n";
+    if(eb_quant_index) std::free(eb_quant_index);
+    if(data_quant_index) std::free(data_quant_index);
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+  // T max_eb = range * max_pwr_eb;
+
+
+  // 定点 LSB 的阈值（退化门控）
+  const T threshold = 1;                          // 幂指数量化阈值（LSB）
+
+
+  // 4) 逐顶点：枚举与该顶点相关的三角面 → 最小 eb
+  const ptrdiff_t si=(ptrdiff_t)W, sj=(ptrdiff_t)1, sk=(ptrdiff_t)(H*W);
+  const size_t dv = (size_t)H*(size_t)W; // 层间位移
+  const size_t plane = (size_t)H * (size_t)W;
+
+  pred_advect_set_params((int)H, (int)W, dt_dx, dt_dy, scale, /*max_disp*/-1.0);
+
+  // 6 个平面邻接方向（左右、上下、主对角）
+  const int di[6] = { 0,  0,  1, -1,  1, -1 }; //y-axis
+  const int dj[6] = { 1, -1,  0,  0,  1, -1 }; //x-axis
+
+  for (int t=0; t<(int)Tt; ++t){
+    if(t % 100 == 0){
+      printf("processing slice %d / %d\n", t, (int)Tt);
+    }
+
+    if (t >= 1){
+      const int64_t* u_prev_plane = (const int64_t*)(U_fp + (size_t)(t-1) * plane);
+      const int64_t* v_prev_plane = (const int64_t*)(V_fp + (size_t)(t-1) * plane);
+      pred_advect_bind_prev_uv(u_prev_plane, v_prev_plane, /*si_uv=*/si, /*sj_uv=*/sj);
+    }else{
+      pred_advect_bind_prev_uv(nullptr, nullptr, 0, 0);
+    }
+
+    for (int i=0; i<(int)H; ++i){
+      for (int j=0; j<(int)W; ++j){
+        const size_t v = vid(t,i,j,sz);
+        // 缓存原始定点值（预测/回写前）
+        T *curU = U_fp + v;
+        T *curV = V_fp + v;
+        const T curU_val = *curU;
+        const T curV_val = *curV;
+
+        // —— 收集最小 eb——
+        T required_eb = max_eb;
+
+
+        // (A) 层内 t：影响 (i-1..i, j-1..j) 的 4 个 cell，每 cell 两三角
+        for (int ci=i-1; ci<=i; ++ci){
+          if (!in_range(ci, (int)H-1)) continue;
+          for (int cj=j-1; cj<=j; ++cj){
+            if (!in_range(cj, (int)W-1)) continue;
+
+            size_t v00 = vid(t,ci,  cj,  sz);
+            size_t v10 = vid(t,ci,  cj+1,sz); //v10=> x=1,y=0
+            size_t v01 = vid(t,ci+1,cj,  sz);
+            size_t v11 = vid(t,ci+1,cj+1,sz);
+
+            // Upper: (v00,v01,v11)
+            if (v==v00 || v==v01 || v==v11){ 
+              #if CP_DEBUG_VISIT
+              MARK_FACE(v00,v01,v11);
+              #endif
+              if (has_cp(cp_faces, v00,v01,v11)) { required_eb = 0;}
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v11],U_fp[v01],U_fp[v00],
+                                                    V_fp[v11],V_fp[v01],V_fp[v00]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // Lower: (v00,v10,v11)
+            if (v==v00 || v==v10 || v==v11){
+              #if CP_DEBUG_VISIT
+              MARK_FACE(v00,v10,v11);
+              #endif
+              if (has_cp(cp_faces, v00,v10,v11)) { required_eb = 0;}
+              T eb = derive_cp_abs_eb_sos_online<T>(U_fp[v11],U_fp[v10],U_fp[v00],
+                                                    V_fp[v11],V_fp[v10],V_fp[v00]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+        
+        // (B1) 侧面 [t, t+1] 
+        // FTK version
+        if (t < (int)Tt-1){
+          for (int k=0; k<6; ++k){
+            int ni=i+di[k], nj=j+dj[k];
+            if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+            size_t a  = vid(t, i, j, sz);
+            size_t b  = vid(t, ni,nj, sz);
+            size_t ap = a + dv, bp = b + dv;
+            if (k == 0 || k==2 || k==4){
+              // (a,b,bp) for k = 0,2,4
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,b,bp);
+              #endif
+              if (has_cp(cp_faces, a,b,bp)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[b],U_fp[a],
+                                                        V_fp[bp],V_fp[b],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+              // (a,bp,ap) for k = 0,2,4
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,bp,ap);
+              #endif
+              if (has_cp(cp_faces, a,bp,ap)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[bp],U_fp[a],
+                                                        V_fp[ap],V_fp[bp],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+            }
+            else{
+              // (a,b,ap) for k = 1,3,5
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,b,ap);
+              #endif
+              if (has_cp(cp_faces, a,b,ap)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[b],U_fp[a],
+                                                        V_fp[ap],V_fp[b],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+            }
+          }
+        }
+
+        // (B2) 侧面 [t-1, t]
+        // FTK version
+        if (t > 0){
+          for (int k=0; k<6 ; ++k){
+            int ni = i + di[k], nj = j + dj[k];
+            if (!in_range(ni,(int)H) || !in_range(nj,(int)W)) continue;
+            size_t a = vid(t,i,j,sz); //v
+            size_t b = vid(t,ni,nj,sz);
+            size_t ap = a - dv, bp = b - dv; //ap,bp为上一层
+            if (k == 0 || k==2 || k==4){
+              // (a,b,ap) for k = 0,2,4
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,b,ap);
+              #endif
+              if (has_cp(cp_faces, a,b,ap)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[ap],U_fp[b],U_fp[a],
+                                                        V_fp[ap],V_fp[b],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+            }
+            else{
+              // (a,b,bp) for k = 1,3,5 //侧面上三角
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,b,bp);
+              #endif
+              if (has_cp(cp_faces, a,b,bp)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[b],U_fp[a],
+                                                        V_fp[bp],V_fp[b],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+                
+              // (a,ap,bp) for k = 1,3,5 //侧面下三角
+              #if CP_DEBUG_VISIT
+              MARK_FACE(a,ap,bp);
+              #endif
+              if (has_cp(cp_faces, a,ap,bp)) { required_eb = 0;}
+                {
+                  T eb = derive_cp_abs_eb_sos_online<T>(U_fp[bp],U_fp[ap],U_fp[a],
+                                                        V_fp[bp],V_fp[ap],V_fp[a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+            }
+
+          }
+        }
+
+        // (C) 内部剖分面：两片 ts ∈ {t, t-1}；每相邻 cell 的 Upper/Lower 各 2 面
+        // (C1) [t, t+1] 内部剖分面
+        if (t < (int)Tt-1){
+          //     ---------
+          //     |  /| T5/|
+          //     | / |  / |
+          //     |/T4| /T6|
+          //     ----X----|
+          //     |T3/|T1/ |
+          //     | / | /  |
+          //     |/T2|/   |
+          //     |---|----|
+      
+          //triange 1 have 1 face FTK version
+          size_t f1a = vid(t,  i,  j,  sz);
+          size_t f1b = vid(t,  i,j+1,  sz);
+          size_t f1c = vid(t,  i-1,j,  sz);
+          size_t f1ap = f1a + dv, f1bp = f1b + dv, f1cp = f1c + dv;
+          if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+            // (f1a,f1bp,f1c)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f1a,f1bp,f1c);
+            #endif
+            if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1c],U_fp[f1bp],U_fp[f1a],
+                                                    V_fp[f1c],V_fp[f1bp],V_fp[f1a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          //triange 2 has 0 face FTK version
+          // triange 3 has 0 face FTK version
+          // triange 4 has 1 face FTK version
+          size_t f4a = vid(t,  i,  j,  sz);
+          size_t f4b = vid(t,  i,j - 1,  sz);
+          size_t f4c = vid(t,  i+1,j,sz);
+          size_t f4ap = f4a + dv, f4bp = f4b + dv, f4cp = f4c + dv;
+          if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+            // (f4a,f4b,f4cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f4a,f4b,f4cp);
+            #endif
+            if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
+                                                    V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          // triange 5 2 faces FTK version
+          size_t f5a = vid(t,  i,  j,  sz);
+          size_t f5b = vid(t,  i+1,j,  sz);
+          size_t f5c = vid(t,  i+1,j+1,sz);
+          size_t f5ap = f5a + dv, f5bp = f5b + dv, f5cp = f5c + dv;
+          if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+            // (f5a,f5bp,f5cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f5a,f5bp,f5cp);
+            #endif
+            if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
+                                                    V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f5a,f5b,f5cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f5a,f5b,f5cp);
+            #endif
+            if (has_cp(cp_faces, f5a,f5b,f5cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5b],U_fp[f5a],
+                                                    V_fp[f5cp],V_fp[f5b],V_fp[f5a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+          // triange 6 has 2 faces FTK version
+          size_t f6a = vid(t,  i,  j,  sz);
+          size_t f6b = vid(t,  i+1,j+1,sz);
+          size_t f6c = vid(t,  i,j+1,  sz);
+          size_t f6ap = f6a + dv, f6bp = f6b + dv, f6cp = f6c + dv;
+          if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+            // (f6a,f6bp,f6c)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f6a,f6bp,f6c);
+            #endif
+            if (has_cp(cp_faces, f6a,f6bp,f6c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6c],U_fp[f6bp],U_fp[f6a],
+                                                    V_fp[f6c],V_fp[f6bp],V_fp[f6a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f6a,f6bp,f6cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f6a,f6bp,f6cp);
+            #endif
+            if (has_cp(cp_faces, f6a,f6bp,f6cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6bp],U_fp[f6a],
+                                                    V_fp[f6cp],V_fp[f6bp],V_fp[f6a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+        }
+
+        // (C2) [t-1, t] 内部剖分面 并不与C1对称\
+        // FTK version
+        if (t > 0){
+          //     ---------
+          //     |  /| T5/|
+          //     | / |  / |
+          //     |/T4| /T6|
+          //     ----X----|
+          //     |T3/|T1/ |
+          //     | / | /  |
+          //     |/T2|/   |
+          //     |---|----|
+
+          //triange 1 have 1 face FTK version
+          size_t f1a = vid(t, i,  j,  sz);
+          size_t f1b = vid(t, i-1, j, sz);
+          size_t f1c = vid(t, i, j+1, sz);
+          size_t f1ap = f1a - dv, f1bp = f1b - dv, f1cp = f1c - dv;
+          if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f1a,f1bp,f1c);
+            #endif
+            if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1c],U_fp[f1a],
+                                                    V_fp[f1bp],V_fp[f1c],V_fp[f1a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            
+          }
+          //triange 2 has 2 faces FTK version
+          size_t f2a = vid(t, i,  j,  sz);
+          size_t f2b = vid(t, i-1,j,  sz);
+          size_t f2c = vid(t, i-1,j-1,sz);
+          size_t f2ap = f2a - dv, f2bp = f2b - dv, f2cp = f2c - dv;
+          if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+            // (f2a,f2bp,f2cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f2a,f2bp,f2cp);
+            #endif
+            if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2cp],U_fp[f2a],
+                                                    V_fp[f2bp],V_fp[f2cp],V_fp[f2a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f2a,f2b,f2cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f2a,f2b,f2cp);
+            #endif
+            if (has_cp(cp_faces, f2a,f2b,f2cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2b],U_fp[f2cp],U_fp[f2a],
+                                                    V_fp[f2b],V_fp[f2cp],V_fp[f2a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          //triange 3  has 2 faces FTK version
+          size_t f3a = vid(t, i,  j,  sz);   
+          size_t f3b = vid(t, i-1,j-1,sz);
+          size_t f3c = vid(t, i,j-1,  sz);
+          size_t f3ap = f3a - dv, f3bp = f3b - dv, f3cp = f3c - dv;
+          if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+            // (f3a,f3bp,f3cp)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f3a,f3bp,f3cp);
+            #endif
+            if (has_cp(cp_faces, f3a,f3bp,f3cp)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3cp],U_fp[f3a],
+                                                    V_fp[f3bp],V_fp[f3cp],V_fp[f3a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+            // (f3a,f3bp,f3c)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f3a,f3bp,f3c);
+            #endif
+            if (has_cp(cp_faces, f3a,f3bp,f3c)) { required_eb=0;}
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3c],U_fp[f3a],
+                                                    V_fp[f3bp],V_fp[f3c],V_fp[f3a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+
+          //triange 4 has 1 face FTK version
+          size_t f4a = vid(t, i,  j,  sz);
+          size_t f4b = vid(t, i,j-1,  sz);
+          size_t f4c = vid(t,i+1,j,  sz);
+          size_t f4ap = f4a - dv, f4bp = f4b - dv, f4cp = f4c - dv;
+          if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+            // (f4a,f4bp,f4c)
+            #if CP_DEBUG_VISIT
+            MARK_FACE(f4a,f4bp,f4c);
+            #endif
+            if (has_cp(cp_faces, f4a,f4bp,f4c)) { required_eb=0; }
+            { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4c],U_fp[f4bp],U_fp[f4a],
+                                                    V_fp[f4c],V_fp[f4bp],V_fp[f4a]);
+              if (eb < required_eb) required_eb = eb;
+            }
+          }
+          //triange 5 has 0 face FTK version
+          //triange 6 has 0 faces FTK version
+        }
+
+        T abs_eb = required_eb;
+        int id = eb_exponential_quantize(abs_eb,base,log_of_base,threshold);
+        
+        if (abs_eb == 0 )
+        {
+          *(eb_pos++) = 0;            // ebid=0 → 无损点
+          unpred.push_back(U[v]);     // 原始浮点（解码端直接回填）
+          unpred.push_back(V[v]);
+          continue;
+        }
+
+        // ===== 量化 eb（配套的新幂指数量化）并编码该顶点 =====
+        {
+          *eb_pos = id;
+
+          bool unpred_flag=false;
+          T dec[2];
+          T abs_err_fp_q[2] = {0,0};
+
+          for (int p=0; p<2; ++p){
+            T *cur  = (p==0)? curU : curV;
+            T  curv = (p==0) ? curU_val : curV_val;
+
+            const T pred = (T)pred_advect_bilinear(cur, t, i, j, si, sj, sk);
+
+            T diff = curv - pred;
+            T qd = (std::llabs(diff)/abs_eb) + 1;
+            if (qd < capacity){
+              qd = (diff > 0) ? qd : -qd;
+              int qindex = (int)(qd/2) + intv_radius;
+              dq_pos[p] = qindex;
+              dec[p] = pred + 2*(qindex - intv_radius)*abs_eb;
+
+              if (std::llabs(dec[p] - curv) > abs_eb){
+                unpred_flag = true; break;
+              }
+              abs_err_fp_q[p] = std::llabs(dec[p] - curv);
+            }else{
+              unpred_flag = true; break;
+            }
+          }
+
+          if (unpred_flag){
+            *(eb_pos++) = 0;                  // 改回无损
+            unpred.push_back(U[v]);
+            unpred.push_back(V[v]);
+          }else{
+            ++eb_pos;
+            dq_pos += 2;
+            *curU = dec[0];
+            *curV = dec[1];
+            //debug自检
+            // double abs_eb_fp = (double)abs_eb / (double)scale;
+            // double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
+            // double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
+            // enc_max_abs_eb_fp   = std::max(enc_max_abs_eb_fp, abs_eb_fp);
+            // enc_max_real_err_fp = std::max(enc_max_real_err_fp, std::max(err_u_fp, err_v_fp));
+          }
+        }
+      }
+    }
+  }
+
+
+  // 5) 打包码流
+  unsigned char *compressed = (unsigned char*)std::malloc( (size_t)(2*N*sizeof(T)) );
+  unsigned char *pos = compressed;
+
+  write_variable_to_dst(pos, scale);
+  std::cout << "write scale = " << (long long)scale << "\n";
+  write_variable_to_dst(pos, base);
+  write_variable_to_dst(pos, threshold);
+  write_variable_to_dst(pos, intv_radius);
+  std::cout << "write intv_radius = " << intv_radius << "\n";
+  write_variable_to_dst(pos, dt_dx);
+  write_variable_to_dst(pos, dt_dy);
+
+  size_t unpred_cnt = unpred.size();
+  std::cout << "write unpred cnt = " << unpred_cnt << ",ratio=" << (double)unpred_cnt/(2*N) << "\n";
+  write_variable_to_dst(pos, unpred_cnt);
+  if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
+  // {
+  //     double unpred_sum = 0.0;
+  //     for (size_t i = 0; i < unpred_cnt; ++i) unpred_sum += unpred[i];
+  //     printf("unpred sum = %.6f\n", unpred_sum);
+  // }
+  #if ZSTD_DETAIL
+  {
+    unsigned char * unpred_after_zstd = NULL;
+    unsigned long unpred_bytes = unpred_cnt * sizeof(unpred[0]);
+    size_t unpred_zstd_size = sz_lossless_compress(ZSTD_COMPRESSOR, 3, reinterpret_cast<unsigned char*>(unpred.data()),unpred_bytes,&unpred_after_zstd);
+    double ratio = static_cast<double>(unpred_bytes) / unpred_zstd_size;
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "ZSTD(unpred): " << unpred_zstd_size
+              << " bytes (orig " << unpred_bytes
+              << ", ratio = " << ratio << "x)\n";
+  }
+  #endif
+
+
+  unsigned char *pos_before_ebq = pos;
+  size_t eb_quant_num = (size_t)(eb_pos - eb_quant_index);
+  write_variable_to_dst(pos, eb_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_quant_index, eb_quant_num, pos);
+  std::cout << "Huffman eb size = " << (size_t)(pos - pos_before_ebq) << "\n";
+  #if ZSTD_DETAIL
+  {
+    unsigned char* ebq_huf_ptr = pos_before_ebq;
+    size_t ebq_huf_size = (size_t)(pos - pos_before_ebq);
+
+    if (ebq_huf_size > 0) {
+        unsigned char* ebq_zstd = nullptr;
+        unsigned long ebq_zstd_size = sz_lossless_compress(
+            ZSTD_COMPRESSOR, 3,
+            ebq_huf_ptr,
+            (unsigned long)ebq_huf_size,
+            &ebq_zstd
+        );
+        if (ZSTD_isError(ebq_zstd_size) || ebq_zstd_size == 0) {
+            std::cerr << "ZSTD compress ebq(Huffman) error: "
+                      << ZSTD_getErrorName(ebq_zstd_size) << "\n";
+        } else {
+            double ratio = (double)ebq_huf_size / (double)ebq_zstd_size;
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "ZSTD(ebq after Huffman): " << ebq_zstd_size
+                      << " bytes (orig " << ebq_huf_size
+                      << ", ratio = " << ratio << "x)\n";
+        }
+        std::free(ebq_zstd);
+    }
+  }
+  #endif
+  std::free(eb_quant_index);
+
+  unsigned char *pos_before_dq = pos;
+  size_t data_quant_num = (size_t)(dq_pos - data_quant_index);
+  write_variable_to_dst(pos, data_quant_num);
+  printf("write dq num = %zu\n", data_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*capacity, data_quant_index, data_quant_num, pos);
+  std::cout << "Huffman dq size = " << (size_t)(pos - pos_before_dq) << "\n";
+  #if ZSTD_DETAIL
+  {
+    unsigned char* dq_huf_ptr = pos_before_dq;
+    size_t dq_huf_size = (size_t)(pos - pos_before_dq);
+
+    if (dq_huf_size > 0) {
+        unsigned char* dq_zstd = nullptr;
+        unsigned long dq_zstd_size = sz_lossless_compress(
+            ZSTD_COMPRESSOR, 3,
+            dq_huf_ptr,
+            (unsigned long)dq_huf_size,
+            &dq_zstd
+        );
+        if (ZSTD_isError(dq_zstd_size) || dq_zstd_size == 0) {
+            std::cerr << "ZSTD compress dq(Huffman) error: "
+                      << ZSTD_getErrorName(dq_zstd_size) << "\n";
+        } else {
+            double ratio = (double)dq_huf_size / (double)dq_zstd_size;
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "ZSTD(dq after Huffman): " << dq_zstd_size
+                      << " bytes (orig " << dq_huf_size
+                      << ", ratio = " << ratio << "x)\n";
+        }
+        std::free(dq_zstd);
+
+        // size_t original_byte = data_quant_num*sizeof(int);
+        // size_t encoded_length = 0;
+        // int* encoded = zero_rle_encode(data_quant_index, data_quant_num, encoded_length);
+        // size_t compressed_byte = encoded_length*sizeof(int);
+        // printf("zero-rle ratio: %f\n",original_byte * 1.0 / compressed_byte);
+        // free(encoded);
+        // 把huffman前后的文件写出来
+        writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_sl.raw", (unsigned char*)data_quant_index, data_quant_num*sizeof(int));
+        writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_sl.huf", pos_before_dq, (size_t)(pos - pos_before_dq));
+        printf("write data_quant_index_sl.raw & data_quant_index_sl.huf done....\n");
+    }
+  }
+  #endif
+  std::free(data_quant_index);
+
+  compressed_size = (size_t)(pos - compressed);
+  std::free(U_fp); std::free(V_fp);
+  return compressed;
+}
 
 template<typename T_data>
 unsigned char*
@@ -4276,7 +5347,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
 
   // 2) 预计算：全局 CP 面集合（一次性）
   auto pre_compute_time = std::chrono::high_resolution_clock::now();
-  auto cp_faces = compute_cp_2p5d_faces<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  auto cp_faces = compute_cp_2p5d_faces_new<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
   auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
 
 
@@ -4285,6 +5356,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
             << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
             << std::endl;
   std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+  std::cout << "SZ_MOP_EVAL_SUBS: " << SZ_MOP_EVAL_SUBS << std::endl;
 
   // 3) 量化/编码缓冲
   int* eb_quant_index  = (int*)std::malloc(N*sizeof(int));
@@ -4378,6 +5450,10 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
     exit(0);
   }
 
+  //统计lookahead整体时间
+  std::chrono::duration<double> total_lookahead(0);
+
+
   pred_advect_set_params(/*H*/H, /*W*/W, /*dt/dx*/dt_dx, /*dt/dy*/dt_dy, /*scale*/scale, /*max_disp*/-1.0);
   const size_t plane = (size_t)H * (size_t)W;
   // 6 个平面邻接方向（左右、上下、主对角）
@@ -4403,21 +5479,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
       for (int bj=0; bj<(int)W; bj+=BW){
 
         // ========== 2) 前视抽样，确定该块预测器 ==========
-        // PM pm = choose_pred_mode_block_lookahead<int64_t>(
-        //             U_fp, V_fp, (int)H, (int)W, t, bi, bj, BH, BW, si, sj, sk);
-
-        // PM pm = choose_pred_mode_block_lookahead_qaware<int64_t>(
-        //     U_fp, V_fp, cp_faces, (int)H, (int)W, (int)Tt, t,
-        //     bi, bj, BH, BW, si, sj, sk,
-        //     /*max_eb_global=*/max_eb, /*capacity=*/capacity,
-        //     /*subs=*/SZ_MOP_EVAL_SUBS,
-        //     /*use_log_cost=*/true,
-        //     /*switch_thresh=*/0.99L);
-        // PM pm = choose_pred_mode_block_lookahead_q(
-        //     U_fp, V_fp, H,W, t, bi,bj, SZ_MOP_BH, SZ_MOP_BW,
-        //     si,sj,sk, /*eb_lsb_cap=*/ std::max<T>(1, max_eb),
-        //     /*subs=*/ SZ_MOP_EVAL_SUBS);
-        // PM pm = choose_pred_mode_block_lookahead_bitspersample(
+        auto lookahead_start =  std::chrono::high_resolution_clock::now();
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample(
         //   U_fp, V_fp,
         //   (int)H,(int)W, t,
         //   bi,bj, BH,BW,
@@ -4426,7 +5489,56 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
         //   /*intv_radius=*/ intv_radius,             // 与编码端一致
         //   /*capacity=*/ capacity,
         //   /*subs=*/ SZ_MOP_EVAL_SUBS);
-        PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample(
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_fast(
+        //   U_fp, V_fp,
+        //   cp_faces,
+        //   (int)H,(int)W, (int)Tt, t,
+        //   bi,bj, BH,BW,
+        //   si,sj,sk,
+        //   /*eb_lsb_cap=*/ std::max<T>(1, max_eb),   // 与编码端一致
+        //   /*intv_radius=*/ intv_radius,             // 与编码端一致
+        //   /*capacity=*/ capacity,
+        //   /*subs=*/ SZ_MOP_EVAL_SUBS);
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_less_cpy(
+        //   U_fp, V_fp,
+        //   (int)H,(int)W, t,
+        //   bi,bj, BH,BW,
+        //   si,sj,sk,
+        //   /*eb_lsb_cap=*/ std::max<T>(1, max_eb),   // 与编码端一致
+        //   /*intv_radius=*/ intv_radius,             // 与编码端一致
+        //   /*capacity=*/ capacity,
+        //   /*subs=*/ SZ_MOP_EVAL_SUBS);
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_6bins(
+        //   U_fp, V_fp,
+        //   (int)H,(int)W, t,
+        //   bi,bj, BH,BW,
+        //   si,sj,sk,
+        //   /*eb_lsb_cap=*/ std::max<T>(1, max_eb),   // 与编码端一致
+        //   /*intv_radius=*/ intv_radius,             // 与编码端一致
+        //   /*capacity=*/ capacity,
+        //   /*subs=*/ SZ_MOP_EVAL_SUBS);
+
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_less_cpy_irbins(
+        //   U_fp, V_fp,
+        //   (int)H,(int)W, t,
+        //   bi,bj, BH,BW,
+        //   si,sj,sk,
+        //   /*eb_lsb_cap=*/ std::max<T>(1, max_eb),   // 与编码端一致
+        //   /*intv_radius=*/ intv_radius,             // 与编码端一致
+        //   /*capacity=*/ capacity,
+        //   /*subs=*/ SZ_MOP_EVAL_SUBS);
+
+        // PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_less_cpy_v2(
+        //   U_fp, V_fp,
+        //   (int)H,(int)W, t,
+        //   bi,bj, BH,BW,
+        //   si,sj,sk,
+        //   /*eb_lsb_cap=*/ std::max<T>(1, max_eb),   // 与编码端一致
+        //   /*intv_radius=*/ intv_radius,             // 与编码端一致
+        //   /*capacity=*/ capacity,
+        //   /*subs=*/ SZ_MOP_EVAL_SUBS);
+
+        PM pm = choose_pred_mode_block_lookahead_bitspersample_entire_block_sample_less_cpy_v3(
           U_fp, V_fp,
           (int)H,(int)W, t,
           bi,bj, BH,BW,
@@ -4435,6 +5547,9 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
           /*intv_radius=*/ intv_radius,             // 与编码端一致
           /*capacity=*/ capacity,
           /*subs=*/ SZ_MOP_EVAL_SUBS);
+
+        auto lookahead_end =  std::chrono::high_resolution_clock::now();
+        total_lookahead += (lookahead_end - lookahead_start);
         const int b_i = bi / BH, b_j = bj / BW;
         block_modes[(size_t)t*blocks_per_t + (size_t)b_i*blocks_j + (size_t)b_j] = (uint8_t)pm;
 
@@ -4452,6 +5567,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
 
             // —— 你原来的 CP/SoS 面枚举，得到 required_eb —— （不变）
             T required_eb = max_eb;
+
             // (A) 层内 t：影响 (i-1..i, j-1..j) 的 4 个 cell，每 cell 两三角
             for (int ci=i-1; ci<=i; ++ci){
               if (!in_range(ci, (int)H-1)) continue;
@@ -4486,7 +5602,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
               }
             }
             
-            // (B1) 侧面 [t, t+1]
+            // (B1) 侧面 [t, t+1] 
+            // FTK version
             if (t < (int)Tt-1){
               for (int k=0; k<6; ++k){
                 int ni=i+di[k], nj=j+dj[k];
@@ -4494,8 +5611,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                 size_t a  = vid(t, i, j, sz);
                 size_t b  = vid(t, ni,nj, sz);
                 size_t ap = a + dv, bp = b + dv;
-                if (k == 0 || k==3 || k==5){
-                  // (a,b,bp) for k = 0,3,5
+                if (k == 0 || k==2 || k==4){
+                  // (a,b,bp) for k = 0,2,4
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,b,bp);
                   #endif
@@ -4505,7 +5622,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                                                             V_fp[bp],V_fp[b],V_fp[a]);
                       if (eb < required_eb) required_eb = eb;
                     }
-                  // (a,bp,ap) for k = 0,3,5
+                  // (a,bp,ap) for k = 0,2,4
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,bp,ap);
                   #endif
@@ -4517,7 +5634,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                     }
                 }
                 else{
-                  // (a,b,ap) for k = 1,2,4
+                  // (a,b,ap) for k = 1,3,5
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,b,ap);
                   #endif
@@ -4528,11 +5645,11 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                       if (eb < required_eb) required_eb = eb;
                     }
                 }
-
               }
             }
 
             // (B2) 侧面 [t-1, t]
+            // FTK version
             if (t > 0){
               for (int k=0; k<6 ; ++k){
                 int ni = i + di[k], nj = j + dj[k];
@@ -4540,8 +5657,8 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                 size_t a = vid(t,i,j,sz); //v
                 size_t b = vid(t,ni,nj,sz);
                 size_t ap = a - dv, bp = b - dv; //ap,bp为上一层
-                if (k == 0 || k==3 || k==5){
-                  // (a,b,ap) for k = 0,3,5
+                if (k == 0 || k==2 || k==4){
+                  // (a,b,ap) for k = 0,2,4
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,b,ap);
                   #endif
@@ -4553,7 +5670,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                     }
                 }
                 else{
-                  // (a,b,bp) for k = 1,2,4 //侧面上三角
+                  // (a,b,bp) for k = 1,3,5 //侧面上三角
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,b,bp);
                   #endif
@@ -4564,7 +5681,7 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
                       if (eb < required_eb) required_eb = eb;
                     }
                     
-                  // (a,ap,bp) for k = 1,2,4 //侧面下三角
+                  // (a,ap,bp) for k = 1,3,5 //侧面下三角
                   #if CP_DEBUG_VISIT
                   MARK_FACE(a,ap,bp);
                   #endif
@@ -4591,101 +5708,97 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
               //     | / | /  |
               //     |/T2|/   |
               //     |---|----|
-          
-              //triange 1 [x,y,t] = [(0,0,0),(1,0,0),(0,-1,0)]: has 2 faces
+              //triange 1 have 1 face FTK version
               size_t f1a = vid(t,  i,  j,  sz);
               size_t f1b = vid(t,  i,j+1,  sz);
               size_t f1c = vid(t,  i-1,j,  sz);
               size_t f1ap = f1a + dv, f1bp = f1b + dv, f1cp = f1c + dv;
               if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
-                // (f1a,f1cp,f1b)
+                // (f1a,f1bp,f1c)
                 #if CP_DEBUG_VISIT
-                MARK_FACE(f1a,f1cp,f1b);
+                MARK_FACE(f1a,f1bp,f1c);
                 #endif
-                if (has_cp(cp_faces, f1a,f1cp,f1b)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1b],U_fp[f1cp],U_fp[f1a],
-                                                        V_fp[f1b],V_fp[f1cp],V_fp[f1a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-                // (f1a,f1cp,f1bp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f1a,f1cp,f1bp);
-                #endif
-                if (has_cp(cp_faces, f1a,f1cp,f1bp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1cp],U_fp[f1a],
-                                                        V_fp[f1bp],V_fp[f1cp],V_fp[f1a]);
+                if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1c],U_fp[f1bp],U_fp[f1a],
+                                                        V_fp[f1c],V_fp[f1bp],V_fp[f1a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
 
-              //triange 2 [x,y,t] = [(0,0,0),(0,-1,0),(-1,-1,0)]: has 2 faces
-              size_t f2a = vid(t,  i,  j,  sz);
-              size_t f2b = vid(t,  i-1,j,  sz);
-              size_t f2c = vid(t,  i-1,j-1,sz);
-              size_t f2ap = f2a + dv, f2bp = f2b + dv, f2cp = f2c + dv;
-              if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-                // (f2a,f2c,f2bp)
+              //triange 2 has 0 face FTK version
+              // triange 3 has 0 face FTK version
+              // triange 4 has 1 face FTK version
+              size_t f4a = vid(t,  i,  j,  sz);
+              size_t f4b = vid(t,  i,j - 1,  sz);
+              size_t f4c = vid(t,  i+1,j,sz);
+              size_t f4ap = f4a + dv, f4bp = f4b + dv, f4cp = f4c + dv;
+              if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
+                // (f4a,f4b,f4cp)
                 #if CP_DEBUG_VISIT
-                MARK_FACE(f2a,f2c,f2bp);
+                MARK_FACE(f4a,f4b,f4cp);
                 #endif
-                if (has_cp(cp_faces, f2a,f2c,f2bp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2c],U_fp[f2a],
-                                                        V_fp[f2bp],V_fp[f2c],V_fp[f2a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-                // (f2a,f2bp,f2cp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f2a,f2bp,f2cp);
-                #endif
-                if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2cp],U_fp[f2bp],U_fp[f2a],
-                                                        V_fp[f2cp],V_fp[f2bp],V_fp[f2a]);
+                if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
+                                                        V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
 
-              // triange 3 [x,y,t] = [(0,0,0),(-1,-1,0),(-1,0,0)]: has 1 faces
-              size_t f3a = vid(t,  i,  j,  sz);
-              size_t f3b = vid(t,  i-1,j-1,sz);
-              size_t f3c = vid(t,  i,j-1,  sz);
-              size_t f3ap = f3a + dv, f3bp = f3b + dv, f3cp = f3c + dv;
-              if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-                // (f3a,f3bp,f3c)
+              // triange 5 2 faces FTK version
+              size_t f5a = vid(t,  i,  j,  sz);
+              size_t f5b = vid(t,  i+1,j,  sz);
+              size_t f5c = vid(t,  i+1,j+1,sz);
+              size_t f5ap = f5a + dv, f5bp = f5b + dv, f5cp = f5c + dv;
+              if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
+                // (f5a,f5bp,f5cp)
                 #if CP_DEBUG_VISIT
-                MARK_FACE(f3a,f3bp,f3c);
+                MARK_FACE(f5a,f5bp,f5cp);
                 #endif
-                if (has_cp(cp_faces, f3a,f3bp,f3c)) {
-                  required_eb=0;
+                if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
+                                                        V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
+                  if (eb < required_eb) required_eb = eb;
                 }
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3c],U_fp[f3bp],U_fp[f3a],
-                                                        V_fp[f3c],V_fp[f3bp],V_fp[f3a]);
+                // (f5a,f5b,f5cp)
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f5a,f5b,f5cp);
+                #endif
+                if (has_cp(cp_faces, f5a,f5b,f5cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5b],U_fp[f5a],
+                                                        V_fp[f5cp],V_fp[f5b],V_fp[f5a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
-              // triange 4 0 faces
-              // triange 5 0 faces
-              // triange 6 [x,y,t] = [(0,0,0),(1,0,0),(1,1,0)]: has 1 faces
+              // triange 6 has 2 faces FTK version
               size_t f6a = vid(t,  i,  j,  sz);
-              size_t f6b = vid(t,  i,j+1,  sz);
-              size_t f6c = vid(t,  i+1,j+1,sz);
+              size_t f6b = vid(t,  i+1,j+1,sz);
+              size_t f6c = vid(t,  i,j+1,  sz);
               size_t f6ap = f6a + dv, f6bp = f6b + dv, f6cp = f6c + dv;
               if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
                 // (f6a,f6bp,f6c)
                 #if CP_DEBUG_VISIT
                 MARK_FACE(f6a,f6bp,f6c);
                 #endif
-                if (has_cp(cp_faces, f6a,f6bp,f6c)) {
-                  required_eb=0; 
-                }
+                if (has_cp(cp_faces, f6a,f6bp,f6c)) { required_eb=0;}
                 { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6c],U_fp[f6bp],U_fp[f6a],
                                                         V_fp[f6c],V_fp[f6bp],V_fp[f6a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+                // (f6a,f6bp,f6cp)
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f6a,f6bp,f6cp);
+                #endif
+                if (has_cp(cp_faces, f6a,f6bp,f6cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6bp],U_fp[f6a],
+                                                        V_fp[f6cp],V_fp[f6bp],V_fp[f6a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
             }
 
 
-            // (C2) [t-1, t] 内部剖分面 并不与C1对称
+            // (C2) [t-1, t] 内部剖分面 并不与C1对称\
+            // FTK version
             if (t > 0){
               //     ---------
               //     |  /| T5/|
@@ -4697,94 +5810,92 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
               //     |/T2|/   |
               //     |---|----|
 
-              //triange 1 0 face
-              //triange 2 0 face
-              //triange 3  has 1 faces
+              //triange 1 have 1 face FTK version
+              size_t f1a = vid(t, i,  j,  sz);
+              size_t f1b = vid(t, i-1, j, sz);
+              size_t f1c = vid(t, i, j+1, sz);
+              size_t f1ap = f1a - dv, f1bp = f1b - dv, f1cp = f1c - dv;
+              if (in_range(i-1,(int)H) && in_range(j+1,(int)W)){
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f1a,f1bp,f1c);
+                #endif
+                if (has_cp(cp_faces, f1a,f1bp,f1c)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f1bp],U_fp[f1c],U_fp[f1a],
+                                                        V_fp[f1bp],V_fp[f1c],V_fp[f1a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+                
+              }
+              //triange 2 has 2 faces FTK version
+              size_t f2a = vid(t, i,  j,  sz);
+              size_t f2b = vid(t, i-1,j,  sz);
+              size_t f2c = vid(t, i-1,j-1,sz);
+              size_t f2ap = f2a - dv, f2bp = f2b - dv, f2cp = f2c - dv;
+              if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
+                // (f2a,f2bp,f2cp)
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f2a,f2bp,f2cp);
+                #endif
+                if (has_cp(cp_faces, f2a,f2bp,f2cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2bp],U_fp[f2cp],U_fp[f2a],
+                                                        V_fp[f2bp],V_fp[f2cp],V_fp[f2a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+                // (f2a,f2b,f2cp)
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f2a,f2b,f2cp);
+                #endif
+                if (has_cp(cp_faces, f2a,f2b,f2cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f2b],U_fp[f2cp],U_fp[f2a],
+                                                        V_fp[f2b],V_fp[f2cp],V_fp[f2a]);
+                  if (eb < required_eb) required_eb = eb;
+                }
+              }
+
+              //triange 3  has 2 faces FTK version
               size_t f3a = vid(t, i,  j,  sz);   
               size_t f3b = vid(t, i-1,j-1,sz);
               size_t f3c = vid(t, i,j-1,  sz);
               size_t f3ap = f3a - dv, f3bp = f3b - dv, f3cp = f3c - dv;
               if (in_range(i-1,(int)H) && in_range(j-1,(int)W)){
-                // (f3a,f3b,f3cp)
+                // (f3a,f3bp,f3cp)
                 #if CP_DEBUG_VISIT
-                MARK_FACE(f3a,f3b,f3cp);
+                MARK_FACE(f3a,f3bp,f3cp);
                 #endif
-                if (has_cp(cp_faces, f3a,f3b,f3cp)) {
-                  required_eb=0;
+                if (has_cp(cp_faces, f3a,f3bp,f3cp)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3cp],U_fp[f3a],
+                                                        V_fp[f3bp],V_fp[f3cp],V_fp[f3a]);
+                  if (eb < required_eb) required_eb = eb;
                 }
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3cp],U_fp[f3b],U_fp[f3a],
-                                                        V_fp[f3cp],V_fp[f3b],V_fp[f3a]);
+                // (f3a,f3bp,f3c)
+                #if CP_DEBUG_VISIT
+                MARK_FACE(f3a,f3bp,f3c);
+                #endif
+                if (has_cp(cp_faces, f3a,f3bp,f3c)) { required_eb=0;}
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f3bp],U_fp[f3c],U_fp[f3a],
+                                                        V_fp[f3bp],V_fp[f3c],V_fp[f3a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
-              //triange 4 has 2 faces
+
+              //triange 4 has 1 face FTK version
               size_t f4a = vid(t, i,  j,  sz);
               size_t f4b = vid(t, i,j-1,  sz);
               size_t f4c = vid(t,i+1,j,  sz);
               size_t f4ap = f4a - dv, f4bp = f4b - dv, f4cp = f4c - dv;
               if (in_range(i+1,(int)H) && in_range(j-1,(int)W)){
-                // (f4a,f4bp,f4cp)
+                // (f4a,f4bp,f4c)
                 #if CP_DEBUG_VISIT
-                MARK_FACE(f4a,f4bp,f4cp);
+                MARK_FACE(f4a,f4bp,f4c);
                 #endif
-                if (has_cp(cp_faces, f4a,f4bp,f4cp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4bp],U_fp[f4a],
-                                                        V_fp[f4cp],V_fp[f4bp],V_fp[f4a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-                // (f4a,f4b,f4cp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f4a,f4b,f4cp);
-                #endif
-                if (has_cp(cp_faces, f4a,f4b,f4cp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4cp],U_fp[f4b],U_fp[f4a],
-                                                        V_fp[f4cp],V_fp[f4b],V_fp[f4a]);
+                if (has_cp(cp_faces, f4a,f4bp,f4c)) { required_eb=0; }
+                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f4c],U_fp[f4bp],U_fp[f4a],
+                                                        V_fp[f4c],V_fp[f4bp],V_fp[f4a]);
                   if (eb < required_eb) required_eb = eb;
                 }
               }
-              //triange 5 has 2 faces
-              size_t f5a = vid(t, i,  j,  sz);
-              size_t f5b = vid(t, i+1,j,  sz);
-              size_t f5c = vid(t, i+1,j+1,sz);
-              size_t f5ap = f5a - dv, f5bp = f5b - dv, f5cp = f5c - dv;
-              if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
-                // (f5a,f5bp,f5cp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f5a,f5bp,f5cp);
-                #endif
-                if (has_cp(cp_faces, f5a,f5bp,f5cp)) { required_eb=0; }
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5cp],U_fp[f5bp],U_fp[f5a],
-                                                        V_fp[f5cp],V_fp[f5bp],V_fp[f5a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-                // (f5a,f5c,f5bp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f5a,f5c,f5bp);
-                #endif
-                if (has_cp(cp_faces, f5a,f5c,f5bp)) { required_eb=0;}
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f5bp],U_fp[f5c],U_fp[f5a],
-                                                        V_fp[f5bp],V_fp[f5c],V_fp[f5a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-              }
-              //triange 6 has 1 faces
-              size_t f6a = vid(t, i,  j,  sz);
-              size_t f6b = vid(t, i,j+1,  sz);
-              size_t f6c = vid(t, i+1,j+1,sz);
-              size_t f6ap = f6a - dv, f6bp = f6b - dv, f6cp = f6c - dv;
-              if (in_range(i+1,(int)H) && in_range(j+1,(int)W)){
-                // (f6a,f6b,f6cp)
-                #if CP_DEBUG_VISIT
-                MARK_FACE(f6a,f6b,f6cp);
-                #endif
-                if (has_cp(cp_faces, f6a,f6b,f6cp)) {
-                  required_eb=0;
-                }
-                { T eb = derive_cp_abs_eb_sos_online<T>(U_fp[f6cp],U_fp[f6b],U_fp[f6a],
-                                                        V_fp[f6cp],V_fp[f6b],V_fp[f6a]);
-                  if (eb < required_eb) required_eb = eb;
-                }
-              }
+              //triange 5 has 0 face FTK version
+              //triange 6 has 0 faces FTK version
             }
 
             T abs_eb = required_eb;
@@ -4842,9 +5953,10 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
     } // for bi
   } // for t
 
+  std::cout << "lookahead total time" << total_lookahead.count() << " seconds\n";
   // 5) 打包码流
   std::vector<uint8_t> pm_bytes;
-  pack_modes_2bit(block_modes, pm_bytes);
+  pack_modes_1bit(block_modes, pm_bytes);
   //print mode percentage
   print_mode_counts(block_modes);
   unsigned char *compressed = (unsigned char*)std::malloc( (size_t)(2*N*sizeof(T)) );
@@ -4896,13 +6008,13 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
 
   if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
     //print sum of unpred.data()
-  {
-    double unpred_sum = 0.0;
-    for (size_t i=0; i<unpred_cnt; ++i){
-      unpred_sum += unpred[i];
-    }
-    printf("unpred sum = %.6f\n", unpred_sum);
-  }
+  // {
+  //   double unpred_sum = 0.0;
+  //   for (size_t i=0; i<unpred_cnt; ++i){
+  //     unpred_sum += unpred[i];
+  //   }
+  //   printf("unpred sum = %.6f\n", unpred_sum);
+  // }
 
   unsigned char * pos_before_ebq = pos;
   size_t eb_quant_num = (size_t)(eb_pos - eb_quant_index);
@@ -4971,15 +6083,15 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop(   //Mixture of 
           }
           std::free(dq_zstd);
       }
-      //再测试一下直接dq用0-rle的前后压缩比
-      size_t original_byte = data_quant_num*sizeof(int);
-      size_t encoded_length = 0;
-      // int* encoded = zero_rle_encode(data_quant_index, 2 * N, encoded_length);
-      int* encoded = zero_rle_encode(data_quant_index, data_quant_num, encoded_length);
-      size_t compressed_byte = encoded_length*sizeof(int);
-      printf("zero-rle ratio: %f\n",original_byte * 1.0 / compressed_byte);
-      free(encoded);
-      //把huffman前后的文件写出来
+      // //再测试一下直接dq用0-rle的前后压缩比
+      // size_t original_byte = data_quant_num*sizeof(int);
+      // size_t encoded_length = 0;
+      // // int* encoded = zero_rle_encode(data_quant_index, 2 * N, encoded_length);
+      // int* encoded = zero_rle_encode(data_quant_index, data_quant_num, encoded_length);
+      // size_t compressed_byte = encoded_length*sizeof(int);
+      // printf("zero-rle ratio: %f\n",original_byte * 1.0 / compressed_byte);
+      // free(encoded);
+      // //把huffman前后的文件写出来
       writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_mop.raw", (unsigned char*)data_quant_index, data_quant_num*sizeof(int));
       writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_mop.huf", pos_before_dq, (size_t)(pos - pos_before_dq));
       printf("write data_quant_index_mop.raw & data_quant_index_mop.huf done....\n");
@@ -7759,4 +8871,437 @@ sz_compress_cp_preserve_sos_2p5d_online_fp_streaming(
 }
 #endif
 
-// ---------------- 解压主函数 ----------------
+template<typename T_data>
+unsigned char*
+sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_ftk_split(
+    const T_data* U, const T_data* V,
+    size_t r1, size_t r2, size_t r3,   // r1=H, r2=W, r3=T (时间最慢)
+    size_t& compressed_size,
+    double max_pwr_eb,                  // 全局绝对误差上限（浮点域）：max_eb(fp)=max_pwr_eb
+    EbMode mode 
+){
+  using T = int64_t;
+  const Size3 sz{ (int)r1,(int)r2,(int)r3 };
+  const size_t H=r1, W=r2, Tt=r3, N=H*W*Tt;
+
+  // 1) 定点化（先乘后 llround）
+  T *U_fp=(T*)std::malloc(N*sizeof(T));
+  T *V_fp=(T*)std::malloc(N*sizeof(T));
+  if(!U_fp || !V_fp){
+    if(U_fp) std::free(U_fp); if(V_fp) std::free(V_fp);
+    compressed_size=0; return nullptr;
+  }
+  T range=0;
+  T scale = convert_to_fixed_point<T_data,T>(U, V, N, U_fp, V_fp, range);
+
+  // 2) 预计算：全局 CP 面集合（一次性）
+  auto pre_compute_time = std::chrono::high_resolution_clock::now();
+  auto cp_faces = compute_cp_2p5d_faces<T>(U_fp, V_fp, (int)H, (int)W, (int)Tt);
+  auto pre_compute_time_end = std::chrono::high_resolution_clock::now();
+
+
+  #if CP_DEBUG_VISIT
+  // 1.1 记录：编码端枚举/检查过的三角面
+  std::unordered_set<FaceKeySZ, FaceKeySZHash> visited_faces;
+
+  // 1.2 小工具：规范化存一下 (a,b,c)
+  auto MARK_FACE = [&](size_t a, size_t b, size_t c){
+      visited_faces.emplace(a,b,c); // FaceKeySZ 构造里已做排序/规范化
+  };
+
+  // 1.3 帮助打印：把 vid -> (t,i,j)
+  auto decode_tij = [&](size_t v){
+      int t = (int)(v / (H*W));
+      size_t rem = v - (size_t)t * H * W;
+      int i = (int)(rem / W);
+      int j = (int)(rem % W);
+      return std::tuple<int,int,int>(t,i,j);
+  };
+
+  // 1.4（可选）分类一下是哪类面
+  auto classify_face = [&](size_t a, size_t b, size_t c){
+      auto [ta,ia,ja] = decode_tij(a);
+      auto [tb,ib,jb] = decode_tij(b);
+      auto [tc,ic,jc] = decode_tij(c);
+      int st = (ta==tb) + (ta==tc) + (tb==tc);
+      if (ta==tb && tb==tc) {
+          // 同一层
+          bool has_diag = ((ia!=ib)||(ja!=jb)) && ((ia!=ic)||(ja!=jc)) && ((ib!=ic)||(jb!=jc));
+          return has_diag ? "layer(tri)" : "layer(?)";
+      } else {
+          // 跨层
+          int cnt_t0 = (ta==tb) + (ta==tc) + (ta==ta); // 粗略判断：有2点在同一层
+          (void)cnt_t0;
+          return "slab";
+      }
+  };
+  #endif
+
+  std::cout << "pre-compute cp faces time second: "
+            << std::chrono::duration<double>(pre_compute_time_end - pre_compute_time).count()
+            << std::endl;
+  std::cout << "Total faces with CP ori: " << cp_faces.size() << std::endl;
+
+  // 3) 量化/编码缓冲
+  int* eb_quant_index  = (int*)std::malloc(N*sizeof(int));
+  int* data_quant_index= (int*)std::malloc(2*N*sizeof(int)); // U/V 交错
+  double enc_max_abs_eb_fp   = 0.0; //编码端自检（浮点）
+  double enc_max_real_err_fp = 0.0;
+  if(!eb_quant_index || !data_quant_index){
+    if(eb_quant_index) std::free(eb_quant_index);
+    if(data_quant_index) std::free(data_quant_index);
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+  int* eb_pos = eb_quant_index;
+  int* dq_pos = data_quant_index;
+  std::vector<T_data> unpred; unpred.reserve((N / 4) * 2);
+
+  // 参数与量化槽
+  const int base = 2;                             // 仍写头，方便向后兼容
+  const int capacity = 65536; //65536
+  const double log_of_base = log2(base);
+  const int intv_radius = (capacity >> 1);
+
+  // 把浮点域绝对误差上限转到定点域（LSB）
+  // const T max_eb = (T) std::llround( (long double)max_pwr_eb * (long double)scale );
+
+  T max_eb = 0;
+  if(mode == EbMode::Relative){
+
+    max_eb = max_pwr_eb * range; // 相对误差转绝对误差
+    printf("Compression Using Relative Eb Mode!\n");
+  }
+  else if (mode == EbMode::Absolute){
+    printf("Compression Using Absolute Eb Mode!\n");
+    max_eb = max_pwr_eb * scale; // 浮点→定点
+  }
+  else{
+    std::cerr << "Error: Unsupported EbMode!\n";
+    if(eb_quant_index) std::free(eb_quant_index);
+    if(data_quant_index) std::free(data_quant_index);
+    std::free(U_fp); std::free(V_fp); compressed_size=0; return nullptr;
+  }
+  // T max_eb = range * max_pwr_eb;
+
+
+  // 定点 LSB 的阈值（退化门控）
+  const T threshold = 1;                          // 幂指数量化阈值（LSB）
+
+
+  // 4) 逐顶点：枚举与该顶点相关的三角面 → 最小 eb
+  const ptrdiff_t si=(ptrdiff_t)W, sj=(ptrdiff_t)1, sk=(ptrdiff_t)(H*W);
+  const size_t dv = (size_t)H*(size_t)W; // 层间位移
+
+  // 6 个平面邻接方向（左右、上下、主对角）
+  const int di[6] = { 0,  0,  1, -1,  1, -1 }; //y-axis
+  const int dj[6] = { 1, -1,  0,  0,  1, -1 }; //x-axis
+
+  for (int t=0; t<(int)Tt; ++t){
+    if(t % 100 == 0){
+      printf("processing slice %d / %d\n", t, (int)Tt);
+    }
+    for (int i=0; i<(int)H; ++i){
+      for (int j=0; j<(int)W; ++j){
+        const size_t v = vid(t,i,j,sz);
+        // 缓存原始定点值（预测/回写前）
+        T *curU = U_fp + v;
+        T *curV = V_fp + v;
+        const T curU_val = *curU;
+        const T curV_val = *curV;
+
+        // —— 收集最小 eb——
+        T required_eb = max_eb;
+
+        auto apply_face = [&](size_t a, size_t b, size_t c) {
+          if (required_eb == 0) return;
+#if CP_DEBUG_VISIT
+          MARK_FACE(a,b,c);
+#endif
+          if (has_cp(cp_faces, a, b, c)) {
+            required_eb = 0;
+            return;
+          }
+          T eb = derive_cp_abs_eb_sos_online_symm<T>(
+              U_fp[a], U_fp[b], U_fp[c],
+              V_fp[a], V_fp[b], V_fp[c]);
+          if (eb < required_eb) required_eb = eb;
+        };
+
+        auto process_sub_triangle = [&](size_t a, size_t b, size_t c) {
+          if (required_eb == 0) return;
+          if (a != v && b != v && c != v) return;
+          apply_face(a, b, c);
+        };
+
+        auto process_tetra = [&](const Tet& tet) {
+          if (required_eb == 0) return;
+          bool contains = false;
+          for (int q = 0; q < 4; ++q) {
+            if (tet.v[q] == v) { contains = true; break; }
+          }
+          if (!contains) return;
+          const int faces[4][3] = {
+              {0,1,2}, {0,1,3}, {1,2,3}, {2,0,3}
+          };
+          for (int f = 0; f < 4 && required_eb != 0; ++f) {
+            process_sub_triangle(
+                tet.v[faces[f][0]],
+                tet.v[faces[f][1]],
+                tet.v[faces[f][2]]);
+          }
+        };
+
+        auto process_prism = [&](int base_t, int ci, int cj, TriInCell which) {
+          if (required_eb == 0) return;
+          const auto base = tri_vertices_2d(ci, cj, which, base_t, sz);
+          std::array<size_t,3> top = {
+              base[0] + dv,
+              base[1] + dv,
+              base[2] + dv
+          };
+          const auto tets = prism_split_3tets(base, top);
+          for (const auto& tet : tets) {
+            process_tetra(tet);
+            if (required_eb == 0) return;
+          }
+        };
+
+        if (Tt == 1) {
+          int ci_start = std::max(0, i - 1);
+          int ci_end = std::min(i, (int)H - 2);
+          int cj_start = std::max(0, j - 1);
+          int cj_end = std::min(j, (int)W - 2);
+          for (int ci = ci_start; ci <= ci_end && required_eb != 0; ++ci) {
+            for (int cj = cj_start; cj <= cj_end && required_eb != 0; ++cj) {
+              const auto upper = tri_vertices_2d(ci, cj, TriInCell::Upper, 0, sz);
+              process_sub_triangle(upper[0], upper[1], upper[2]);
+              if (required_eb == 0) break;
+              const auto lower = tri_vertices_2d(ci, cj, TriInCell::Lower, 0, sz);
+              process_sub_triangle(lower[0], lower[1], lower[2]);
+            }
+          }
+        } else {
+          int base_t_start = std::max(0, t - 1);
+          int base_t_end = std::min(t, (int)Tt - 2);
+          if (base_t_start <= base_t_end) {
+            int ci_start = std::max(0, i - 1);
+            int ci_end = std::min(i, (int)H - 2);
+            int cj_start = std::max(0, j - 1);
+            int cj_end = std::min(j, (int)W - 2);
+            for (int base_t = base_t_start; base_t <= base_t_end && required_eb != 0; ++base_t) {
+              for (int ci = ci_start; ci <= ci_end && required_eb != 0; ++ci) {
+                for (int cj = cj_start; cj <= cj_end && required_eb != 0; ++cj) {
+                  process_prism(base_t, ci, cj, TriInCell::Upper);
+                  if (required_eb == 0) break;
+                  process_prism(base_t, ci, cj, TriInCell::Lower);
+                }
+              }
+            }
+          }
+        }
+        T abs_eb = required_eb;
+        int id = eb_exponential_quantize(abs_eb,base,log_of_base,threshold);
+        
+        if (abs_eb == 0 )
+        {
+          *(eb_pos++) = 0;            // ebid=0 → 无损点
+          unpred.push_back(U[v]);     // 原始浮点（解码端直接回填）
+          unpred.push_back(V[v]);
+          continue;
+        }
+
+        // ===== 量化 eb（配套的新幂指数量化）并编码该顶点 =====
+        {
+          // T abs_eb = required_eb;
+          // // int id = eb_exponential_quantize_new(abs_eb, threshold); // id>=1，abs_eb 替换为代表值
+          
+          // // *eb_pos = id;
+          // int id = eb_exponential_quantize(abs_eb,base,log_of_base,threshold);
+          *eb_pos = id;
+
+          bool unpred_flag=false;
+          T dec[2];
+          T abs_err_fp_q[2] = {0,0};
+
+          for (int p=0; p<2; ++p){
+            T *cur  = (p==0)? curU : curV;
+            T  curv = (p==0) ? curU_val : curV_val;
+
+            // 3D 一阶 Lorenzo（时间最慢）
+            T d0 = (t&&i&&j)? cur[-sk - si - sj] : 0;
+            T d1 = (t&&i)   ? cur[-sk - si]      : 0;
+            T d2 = (t&&j)   ? cur[-sk - sj]      : 0;
+            T d3 = (t)      ? cur[-sk]           : 0;
+            T d4 = (i&&j)   ? cur[-si - sj]      : 0;
+            T d5 = (i)      ? cur[-si]           : 0;
+            T d6 = (j)      ? cur[-sj]           : 0;
+            T pred = d0 + d3 + d5 + d6 - d1 - d2 - d4;
+
+            T diff = curv - pred;
+            T qd = (std::llabs(diff)/abs_eb) + 1;
+            if (qd < capacity){
+              qd = (diff > 0) ? qd : -qd;
+              int qindex = (int)(qd/2) + intv_radius;
+              dq_pos[p] = qindex;
+              dec[p] = pred + 2*(qindex - intv_radius)*abs_eb;
+
+              // 守门：必须用 *代表值* abs_eb 校验
+              if (std::llabs(dec[p] - curv) > abs_eb){
+              // if (std::llabs(dec[p] - curv) > required_eb){
+                unpred_flag = true; break;
+              }
+              abs_err_fp_q[p] = std::llabs(dec[p] - curv);
+            }else{
+              unpred_flag = true; break;
+            }
+          }
+
+          if (unpred_flag){
+            *(eb_pos++) = 0;                  // 改回无损
+            unpred.push_back(U[v]);
+            unpred.push_back(V[v]);
+          }else{
+            ++eb_pos;
+            dq_pos += 2;
+            *curU = dec[0];
+            *curV = dec[1];
+
+            // 编码端自检（浮点域）
+            // double abs_eb_fp = (double)abs_eb / (double)scale;
+            // double err_u_fp  = (double)abs_err_fp_q[0] / (double)scale;
+            // double err_v_fp  = (double)abs_err_fp_q[1] / (double)scale;
+            // enc_max_abs_eb_fp   = std::max(enc_max_abs_eb_fp, abs_eb_fp);
+            // enc_max_real_err_fp = std::max(enc_max_real_err_fp, std::max(err_u_fp, err_v_fp));
+          }
+        }
+      }
+    }
+  }
+
+  // std::cerr << "[ENC] max abs_eb(fp) = " << enc_max_abs_eb_fp
+  //           << ", max actual |err|(fp) = " << enc_max_real_err_fp << "\n";
+
+  // 5) 打包码流
+  unsigned char *compressed = (unsigned char*)std::malloc( (size_t)(2*N*sizeof(T)) );
+  unsigned char *pos = compressed;
+
+  write_variable_to_dst(pos, scale);
+  std::cout << "write scale = " << (long long)scale << "\n";
+  write_variable_to_dst(pos, base);
+  write_variable_to_dst(pos, threshold);
+  write_variable_to_dst(pos, intv_radius);
+  std::cout << "write intv_radius = " << intv_radius << "\n";
+
+  size_t unpred_cnt = unpred.size();
+  std::cout << "write unpred cnt = " << unpred_cnt << ",ratio=" << (double)unpred_cnt/(2*N) << "\n";
+  write_variable_to_dst(pos, unpred_cnt);
+  if (unpred_cnt) write_array_to_dst(pos, unpred.data(), unpred_cnt);
+  // // 打印求和
+  // {
+  //     double unpred_sum = 0.0;
+  //     for (size_t i = 0; i < unpred_cnt; ++i) unpred_sum += unpred[i];
+  //     printf("unpred sum = %.6f\n", unpred_sum);
+  // }
+  #if ZSTD_DETAIL
+  {
+    // use zstd, calculate size after zstd
+    unsigned char * unpred_after_zstd = NULL;
+    unsigned long unpred_bytes = unpred_cnt * sizeof(unpred[0]);
+    size_t unpred_zstd_size = sz_lossless_compress(ZSTD_COMPRESSOR, 3, reinterpret_cast<unsigned char*>(unpred.data()),unpred_bytes,&unpred_after_zstd);
+    double ratio = static_cast<double>(unpred_bytes) / unpred_zstd_size;
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "ZSTD(unpred): " << unpred_zstd_size
+              << " bytes (orig " << unpred_bytes
+              << ", ratio = " << ratio << "x)\n";
+  }
+  #endif
+
+
+  unsigned char *pos_before_ebq = pos;
+  size_t eb_quant_num = (size_t)(eb_pos - eb_quant_index);
+  write_variable_to_dst(pos, eb_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*1024, eb_quant_index, eb_quant_num, pos);
+  std::cout << "Huffman eb size = " << (size_t)(pos - pos_before_ebq) << "\n";
+  #if ZSTD_DETAIL
+  {
+    unsigned char* ebq_huf_ptr = pos_before_ebq;
+    size_t ebq_huf_size = (size_t)(pos - pos_before_ebq);
+
+    if (ebq_huf_size > 0) {
+        unsigned char* ebq_zstd = nullptr;
+        unsigned long ebq_zstd_size = sz_lossless_compress(
+            ZSTD_COMPRESSOR, 3,
+            ebq_huf_ptr,
+            (unsigned long)ebq_huf_size,
+            &ebq_zstd
+        );
+        if (ZSTD_isError(ebq_zstd_size) || ebq_zstd_size == 0) {
+            std::cerr << "ZSTD compress ebq(Huffman) error: "
+                      << ZSTD_getErrorName(ebq_zstd_size) << "\n";
+        } else {
+            double ratio = (double)ebq_huf_size / (double)ebq_zstd_size;
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "ZSTD(ebq after Huffman): " << ebq_zstd_size
+                      << " bytes (orig " << ebq_huf_size
+                      << ", ratio = " << ratio << "x)\n";
+        }
+        std::free(ebq_zstd);
+    }
+  }
+  #endif
+  std::free(eb_quant_index);
+
+  unsigned char *pos_before_dq = pos;
+  size_t data_quant_num = (size_t)(dq_pos - data_quant_index);
+  write_variable_to_dst(pos, data_quant_num);
+  printf("write dq num = %zu\n", data_quant_num);
+  Huffman_encode_tree_and_data(/*state_num=*/2*capacity, data_quant_index, data_quant_num, pos);
+  //print size of huffman
+  std::cout << "Huffman dq size = " << (size_t)(pos - pos_before_dq) << "\n";
+  #if ZSTD_DETAIL
+  // —— 对 Huffman 后的 dq 字节块做 ZSTD ——
+  {
+    unsigned char* dq_huf_ptr = pos_before_dq;
+    size_t dq_huf_size = (size_t)(pos - pos_before_dq);
+
+    if (dq_huf_size > 0) {
+        unsigned char* dq_zstd = nullptr;
+        unsigned long dq_zstd_size = sz_lossless_compress(
+            ZSTD_COMPRESSOR, 3,
+            dq_huf_ptr,
+            (unsigned long)dq_huf_size,
+            &dq_zstd
+        );
+        if (ZSTD_isError(dq_zstd_size) || dq_zstd_size == 0) {
+            std::cerr << "ZSTD compress dq(Huffman) error: "
+                      << ZSTD_getErrorName(dq_zstd_size) << "\n";
+        } else {
+            double ratio = (double)dq_huf_size / (double)dq_zstd_size;
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "ZSTD(dq after Huffman): " << dq_zstd_size
+                      << " bytes (orig " << dq_huf_size
+                      << ", ratio = " << ratio << "x)\n";
+        }
+        std::free(dq_zstd);
+
+        //再测试一下直接dq用0-rle的前后压缩比
+        // size_t original_byte = data_quant_num*sizeof(int);
+        // size_t encoded_length = 0;
+        // int* encoded = zero_rle_encode(data_quant_index, data_quant_num, encoded_length);
+        // //int* encoded = tri_rle_encode(data_quant_index, data_quant_num, encoded_length);
+        // size_t compressed_byte = encoded_length*sizeof(int);
+        // printf("zero-rle ratio: %f\n",original_byte * 1.0 / compressed_byte);
+        // free(encoded);
+        // //把huffman前后的文件写出来
+        writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_default.raw", (unsigned char*)data_quant_index, data_quant_num*sizeof(int));
+        writefile("/project/xli281_uksr/mxia/tmp_output/data_quant_index_default.huf", pos_before_dq, (size_t)(pos - pos_before_dq));
+        printf("write data_quant_index_default.raw & data_quant_index_default.huf done....\n");
+    }
+  }
+  #endif
+  std::free(data_quant_index);
+
+  compressed_size = (size_t)(pos - compressed);
+  std::free(U_fp); std::free(V_fp);
+  return compressed;
+}

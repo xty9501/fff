@@ -1,11 +1,13 @@
 #define CP_DEBUG_VISIT 0
 #define DEBUG_USE 0
 #define VERBOSE 0
-#define VERIFY 1 //验证
-#define DETAIL 0 //详细
+#define VERIFY 0 //验证 0 when test
+#define DETAIL 0 //详细 0 when test
 #define CPSZ_BASELINE 0 //baseline results for cpsz
 #define STREAMING 0 //streaming mode
-#define VISUALIZE 0 //visualization mode
+#define VISUALIZE 0 //visualization mode 0 when test
+#define WRITEOUT 0 //write output 0 when test
+#define STOP_AFTER_VERIFY 1 //stop after verification 1 when test
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -222,6 +224,12 @@ int main(int argc, char** argv) {
             U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T,
             compressed_size, error_bound, mode);
     }
+    else if (method == "mop_p"){
+        printf("sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop_parallel...\n");
+        compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mop_parallel(
+            U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T,
+            compressed_size, error_bound, mode);
+    }
     else if (method == "mixed_order"){
         printf("sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mixed_order...\n");
         compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_mixed_order(
@@ -239,6 +247,34 @@ int main(int argc, char** argv) {
         compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_simple(
             U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T,
             compressed_size, error_bound, mode);
+    }
+    else if (method == "sl"){
+        printf("sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_cpmap_sl...\n");
+        //临时写法
+        double dt_dx, dt_dy;
+        if (dim_W ==640 && dim_H == 80){
+            dt_dx = 0.8;
+            dt_dy = 0.8;
+        }
+        else if (dim_W == 150 && dim_H == 450){
+            dt_dx = 0.01 / 0.66666666;
+            dt_dy = 0.01 / 0.66666666;
+        }
+        else if (dim_W == 450 && dim_H == 200){
+            dt_dx = (4.428 / 499) / (10.0 / 450);
+            dt_dy = (4.428 / 499) / (4.0 / 200);
+        }
+        else if (dim_W == 512 && dim_H == 512){
+            dt_dx = (10.0 / 1000.0) / ( 1.0 / 512.0);
+            dt_dy = (10.0 / 1000.0) / ( 1.0 / 512.0);
+        }
+        else{
+            std::cout << "Please provide dt/dx and dt/dy for this dataset!" << std::endl;
+            exit(0);
+        }
+        compressed = sz_compress_cp_preserve_sos_2p5d_online_fp_vertexwise_sl(
+            U_ptr, V_ptr, /*H=*/dim_H, /*W=*/dim_W, /*T=*/dim_T,
+            compressed_size, error_bound, mode, dt_dx, dt_dy);
     }
     else{
         std::cerr << "Unknown method: " << method << "\n";
@@ -319,6 +355,10 @@ int main(int argc, char** argv) {
     //     printf("sz_decompress_cp_preserve_sos_2p5d_fp_simple...\n");
     //     sz_decompress_cp_preserve_sos_2p5d_fp_simple<float>(decompressed, H, W, T, U_dec, V_dec);
     // }
+    else if (method =="sl"){
+        printf("sz_decompress_cp_preserve_sos_2p5d_fp_sl...\n");
+        sz_decompress_cp_preserve_sos_2p5d_fp_sl<float>(decompressed, H, W, T, U_dec, V_dec);
+    }
     else{
         std::cerr << "Unknown method: " << method << "\n";
         return 1;
@@ -335,7 +375,7 @@ int main(int argc, char** argv) {
     cout << "decompression time in sec:" << std::chrono::duration<double>(dec_end_t - dec_start_t).count() << endl;
 
 
-    #if VERIFY
+#if VERIFY
     printf("start verify....\n");
     size_t verify_elements = total_elements;
     float* U_ori = nullptr;
@@ -363,34 +403,58 @@ int main(int argc, char** argv) {
     #endif
 
     verify(U_ori, V_ori, U_dec, V_dec, H, W, T);
+    #if STOP_AFTER_VERIFY
+    exit(0);
+    #endif
 
     int64_t* U_ori_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
     int64_t* V_ori_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
     int64_t range_ori = 0;
     int64_t scale_ori = convert_to_fixed_point(U_ori, V_ori, verify_elements, U_ori_fp, V_ori_fp, range_ori);
     printf("original scale = %ld\n", scale_ori);
-    auto cp_faces_ori = compute_cp_2p5d_faces(U_ori_fp, V_ori_fp, H, W, T, dim_str);
-    std::cout << "Total faces with CP ori: " << cp_faces_ori.size() << std::endl;
 
     int64_t* U_dec_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
     int64_t* V_dec_fp = (int64_t*)std::malloc(verify_elements * sizeof(int64_t));
     convert_to_fixed_point_given_factor(U_dec, V_dec, verify_elements, U_dec_fp, V_dec_fp, scale_ori);
 
-    auto cp_faces_dec = compute_cp_2p5d_faces(U_dec_fp, V_dec_fp, H, W, T);
-
+    auto cp_faces_dec = compute_cp_2p5d_faces_new(U_dec_fp, V_dec_fp, H, W, T);
     std::cout << "Total faces with CP dec: " << cp_faces_dec.size() << std::endl;
+
+    auto cp_faces_ori = compute_cp_2p5d_faces_new(U_ori_fp, V_ori_fp, H, W, T);
+    std::cout << "Total faces with CP ori: " << cp_faces_ori.size() << std::endl;
+
     // std::cout << (are_unordered_sets_equal(cp_faces_dec, cp_faces_ori) ? "CP face sets are equal." : "CP face sets differ!") << std::endl;
     bool cp_equal = are_unordered_sets_equal(cp_faces_dec, cp_faces_ori);
     std::cout << (cp_equal ? "CP face sets are equal." : "CP face sets differ!") << std::endl;
     if (!cp_equal) {
         print_cp_face_diffs(cp_faces_dec, cp_faces_ori, U_dec, V_dec, U_ori, V_ori,U_dec_fp, V_dec_fp, U_ori_fp, V_ori_fp, H, W, T);
     }
-    exit(0);
+
+    #if VISUALIZE
+        {
+            // Export traced critical point trajectories to VTK PolyData (.vtp)
+            const std::string out_dir = "/project/xli281_uksr/mxia/tmp_output/tracing_vtk";
+            const std::string base_name_ori = std::to_string(dim_W) + "_" + std::to_string(dim_H) + "_" + std::to_string(dim_T) + ".vtp";
+            const std::string base_name_dec = std::to_string(dim_W) + "_" + std::to_string(dim_H) + "_" + std::to_string(dim_T) + "_" + method + "_" + std::to_string(error_bound) + ".vtp";
+            const std::string f_ori = out_dir + "/ori_" + base_name_ori;
+            const std::string f_dec = out_dir + "/dec_" + base_name_dec;
+            // best-effort ensure directory exists
+            std::string mkdir_cmd = std::string("mkdir -p ") + out_dir;
+            (void)std::system(mkdir_cmd.c_str());
+
+            const Size3 sz_dims{H, W, T};
+            bool ok1 = ftk_write_traced_critical_point_vtp(f_ori, U_ori, V_ori, sz_dims, cp_faces_ori);
+            bool ok2 = ftk_write_traced_critical_point_vtp(f_dec, U_dec, V_dec, sz_dims, cp_faces_dec);
+            std::cout << "[VISUALIZE] Wrote VTP ori: " << f_ori << " (" << (ok1?"ok":"fail") << ")\n";
+            std::cout << "[VISUALIZE] Wrote VTP dec: " << f_dec << " (" << (ok2?"ok":"fail") << ")\n";
+        }
+    #endif
+
 
     #if DETAIL
-      const std::string csv_name =
-      std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + ".csv";
-      summarize_cp_faces_per_layer_and_slab(cp_faces_dec, cp_faces_ori, H, W, T, csv_name);
+    //   const std::string csv_name = std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + ".csv";
+    //   summarize_cp_faces_per_layer_and_slab(cp_faces_dec, cp_faces_ori, H, W, T, csv_name);
+    summarize_cp_faces_per_layer_and_slab(cp_faces_dec, cp_faces_ori, H, W, T, "");
     #endif
 
 
@@ -403,7 +467,7 @@ int main(int argc, char** argv) {
     std::free(V_ori_fp);
     std::free(U_dec_fp);
     std::free(V_dec_fp);
-    #endif
+#endif
 
     #if CPSZ_BASELINE && !STREAMING
     float *U_dec_cpsz = nullptr;
@@ -552,31 +616,65 @@ int main(int argc, char** argv) {
     }
 
     if (U_dec_cpsz_fp && V_dec_cpsz_fp && U_ori_cpsz_fp && V_ori_cpsz_fp) {
-        auto cp_faces_cpsz = compute_cp_2p5d_faces(U_dec_cpsz_fp, V_dec_cpsz_fp, H, W, T);
+        auto cp_faces_cpsz = compute_cp_2p5d_faces_new(U_dec_cpsz_fp, V_dec_cpsz_fp, H, W, T);
         std::cout << "Total faces with CP dec CPSZ baseline: " << cp_faces_cpsz.size() << std::endl;
 
-        auto cp_faces_ori_cpsz = compute_cp_2p5d_faces(U_ori_cpsz_fp, V_ori_cpsz_fp, H, W, T);
-        const std::string csv_name_cpsz =
-            std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + "_" + std::to_string(error_bound) + "_cpsz.csv";
-        summarize_cp_faces_per_layer_and_slab(cp_faces_cpsz, cp_faces_ori_cpsz, H, W, T, csv_name_cpsz);
-        std::cout << "CPSZ baseline summary written to " << csv_name_cpsz << std::endl;
+        auto cp_faces_ori_cpsz = compute_cp_2p5d_faces_new(U_ori_cpsz_fp, V_ori_cpsz_fp, H, W, T);
+        // const std::string csv_name_cpsz =
+        //     std::to_string(H) + "_" + std::to_string(W) + "_" + std::to_string(T) + "_" + std::to_string(error_bound) + "_cpsz.csv";
+        // summarize_cp_faces_per_layer_and_slab(cp_faces_cpsz, cp_faces_ori_cpsz, H, W, T, csv_name_cpsz);
+        // std::cout << "CPSZ baseline summary written to " << csv_name_cpsz << std::endl;
+        summarize_cp_faces_per_layer_and_slab(cp_faces_cpsz, cp_faces_ori_cpsz, H, W, T, "");
     }
 
     if (U_dec_cpsz && V_dec_cpsz) {
         printf("start verify CPSZ baseline....\n");
         verify(U_ptr, V_ptr, U_dec_cpsz, V_dec_cpsz, H, W, T);
     }
+        #if VISUALIZE
+        {
+            // Export traced critical point trajectories to VTK PolyData (.vtp)
+            const std::string out_dir = "/project/xli281_uksr/mxia/tmp_output/tracing_vtk";
+            const std::string base_name_cpsz = std::to_string(dim_W) + "_" + std::to_string(dim_H) + "_" + std::to_string(dim_T) + "_" + std::to_string(error_bound) + "_cpsz.vtp";
+            const std::string f_cpsz = out_dir + "/dec_cpsz_" + base_name_cpsz;
+            // best-effort ensure directory exists
+            std::string mkdir_cmd = std::string("mkdir -p ") + out_dir;
+            (void)std::system(mkdir_cmd.c_str());
 
+            const Size3 sz_dims{H, W, T};
+            bool ok = ftk_write_traced_critical_point_vtp(f_cpsz, U_dec_cpsz, V_dec_cpsz, sz_dims, cp_faces_ori);
+            std::cout << "[VISUALIZE] Wrote VTP dec CPSZ: " << f_cpsz << " (" << (ok?"ok":"fail") << ")\n";
+        }
+        #endif
+    #endif
+
+    #if WRITEOUT
+    const std::string out_dir = "/project/xli281_uksr/mxia/tmp_output/tracing_vtk";
+    std::string out_U = out_dir + "/U_dec_" + dim_str + "_" + method + "_" + std::to_string(error_bound) + ".bin";
+    std::string out_V = out_dir + "/V_dec_" + dim_str + "_" + method + "_" + std::to_string(error_bound) + ".bin";
+    writefile<float>(out_U.c_str(), U_dec, total_elements);
+    writefile<float>(out_V.c_str(), V_dec, total_elements);
+    std::cout << "Decompressed data written to " << out_U << " and " << out_V << std::endl;
+        #if CPSZ_BASELINE
+        if (U_dec_cpsz && V_dec_cpsz) {
+            std::string out_U_cpsz = "U_dec_cpsz_" + dim_str + "_" + std::to_string(error_bound) + ".bin";
+            std::string out_V_cpsz = "V_dec_cpsz_" + dim_str + "_" + std::to_string(error_bound) + ".bin";
+            writefile<float>(U_dec_cpsz, total_elements, out_U_cpsz.c_str());
+            writefile<float>(V_dec_cpsz, total_elements, out_V_cpsz.c_str());
+            std::cout << "CPSZ baseline decompressed data written to " << out_U_cpsz << " and " << out_V_cpsz << std::endl;
+        }
+        #endif
+    #endif
+    
+    //释放返回的缓冲区（由函数 malloc 分配）
+    #if CPSZ_BASELINE
     std::free(U_dec_cpsz);
     std::free(V_dec_cpsz);
     std::free(U_dec_cpsz_fp);
     std::free(V_dec_cpsz_fp);
     std::free(U_ori_cpsz_fp);
     std::free(V_ori_cpsz_fp);
-
-#endif
-    
-    //释放返回的缓冲区（由函数 malloc 分配）
+    #endif
     std::free(decompressed);
     std::free(U_ptr);
     std::free(V_ptr);

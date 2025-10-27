@@ -351,6 +351,8 @@ T derive_cp_abs_eb_sos_online_symm(const T u0, const T u1, const T u2, const T v
 	T eb3 = derive_cp_abs_eb_sos_online(u1, u0, u2, v1, v0, v2);
 	return std::min({eb1, eb2, eb3});
 }
+template long derive_cp_abs_eb_sos_online_symm<long>(long, long, long, long, long, long);
+
 template<typename T_fp>
 static int 
 check_cp(T_fp vf[3][2], int indices[3]){

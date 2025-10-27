@@ -124,6 +124,132 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp(
 
 
 template<typename T_data>
+bool sz_decompress_cp_preserve_sos_2p5d_fp_sl(
+    const unsigned char* compressed,
+    size_t r1, size_t r2, size_t r3,
+    T_data*& U, T_data*& V)
+{
+    using T = int64_t;
+    const size_t H = r1, W = r2, Tt = r3, N = H * W * Tt;
+
+    if (U) std::free(U);
+    if (V) std::free(V);
+
+    const unsigned char* p = compressed;
+    T scale = 0; read_variable_from_src(p, scale);
+    printf("read scale = %ld\n", scale);
+    int base = 0; read_variable_from_src(p, base);
+    printf("read base = %d\n", base);
+    T threshold = 0; read_variable_from_src(p, threshold);
+    printf("read threshold = %ld\n", threshold);
+    int intv_radius = 0; read_variable_from_src(p, intv_radius);
+    printf("read intv_radius = %d\n", intv_radius);
+    const int capacity = (intv_radius << 1);
+    double dt_dx = 0.0; read_variable_from_src(p, dt_dx);
+    double dt_dy = 0.0; read_variable_from_src(p, dt_dy);
+    printf("read dt/dx = %lf, dt/dy = %lf\n", dt_dx, dt_dy);
+
+    size_t unpred_cnt = 0; read_variable_from_src(p, unpred_cnt);
+    if (unpred_cnt % 2 != 0) return false;
+
+    const T_data* unpred_data = reinterpret_cast<const T_data*>(p);
+    const T_data* unpred_pos = unpred_data;
+    p += unpred_cnt * sizeof(T_data);
+
+    size_t eb_num = 0; read_variable_from_src(p, eb_num);
+    int* eb_idx = Huffman_decode_tree_and_data(/*state_num=*/2 * 1024, eb_num, p);
+    if (!eb_idx) return false;
+
+    size_t dq_num = 0; read_variable_from_src(p, dq_num);
+    int* dq = Huffman_decode_tree_and_data(/*state_num=*/2 * 65536, dq_num, p);
+    if (!dq) { std::free(eb_idx); return false; }
+
+    if (eb_num != N) { std::free(eb_idx); std::free(dq); return false; }
+    const size_t n_unpred_points = unpred_cnt / 2;
+    if (dq_num != 2 * (N - n_unpred_points)) { std::free(eb_idx); std::free(dq); return false; }
+
+    T* U_fp = (T*)std::malloc(N * sizeof(T));
+    T* V_fp = (T*)std::malloc(N * sizeof(T));
+    if (!U_fp || !V_fp) {
+        if (U_fp) std::free(U_fp);
+        if (V_fp) std::free(V_fp);
+        std::free(eb_idx); std::free(dq);
+        return false;
+    }
+
+    pred_advect_set_params((int)H, (int)W, dt_dx, dt_dy, (double)scale, /*max_disp*/-1.0);
+    const size_t plane = H * W;
+
+    T* U_pos = U_fp;
+    T* V_pos = V_fp;
+    int* eb_pos = eb_idx;
+    int* dq_pos = dq;
+    std::vector<size_t> unpred_indices; unpred_indices.reserve(n_unpred_points);
+
+    const ptrdiff_t si = (ptrdiff_t)W;
+    const ptrdiff_t sj = (ptrdiff_t)1;
+    const ptrdiff_t sk = (ptrdiff_t)(H * W);
+
+    for (int t = 0; t < (int)Tt; ++t) {
+        if (t >= 1) {
+            const T* u_prev_plane = U_fp + (size_t)(t - 1) * plane;
+            const T* v_prev_plane = V_fp + (size_t)(t - 1) * plane;
+            pred_advect_bind_prev_uv(u_prev_plane, v_prev_plane, si, sj);
+        } else {
+            pred_advect_bind_prev_uv(nullptr, nullptr, 0, 0);
+        }
+
+        for (int i = 0; i < (int)H; ++i) {
+            for (int j = 0; j < (int)W; ++j) {
+                int ebid = *eb_pos++;
+
+                if (ebid == 0) {
+                    size_t off = (size_t)(U_pos - U_fp);
+                    unpred_indices.push_back(off);
+                    *U_pos = *(unpred_pos++) * scale;
+                    *V_pos = *(unpred_pos++) * scale;
+                } else {
+                    T abs_eb = (T)(pow(base, ebid) * (double)threshold);
+
+                    {
+                        const T pred = (T)pred_advect_bilinear(U_pos, t, i, j, si, sj, sk);
+                        const int qidx = *dq_pos++;
+                        *U_pos = pred + (T)2 * (qidx - intv_radius) * abs_eb;
+                    }
+                    {
+                        const T pred = (T)pred_advect_bilinear(V_pos, t, i, j, si, sj, sk);
+                        const int qidx = *dq_pos++;
+                        *V_pos = pred + (T)2 * (qidx - intv_radius) * abs_eb;
+                    }
+                }
+                ++U_pos; ++V_pos;
+            }
+        }
+    }
+
+    U = (T_data*)std::malloc(N * sizeof(T_data));
+    V = (T_data*)std::malloc(N * sizeof(T_data));
+    if (!U || !V) {
+        std::free(U); std::free(V);
+        std::free(U_fp); std::free(V_fp);
+        std::free(eb_idx); std::free(dq);
+        return false;
+    }
+    convert_to_floating_point(U_fp, V_fp, N, U, V, scale);
+
+    unpred_pos = unpred_data;
+    for (size_t off : unpred_indices) {
+        U[off] = *unpred_pos++;
+        V[off] = *unpred_pos++;
+    }
+
+    std::free(U_fp); std::free(V_fp);
+    std::free(eb_idx); std::free(dq);
+    return true;
+}
+
+
+template<typename T_data>
 bool sz_decompress_cp_preserve_sos_2p5d_fp_warped_Lorenzo(
     const unsigned char* compressed,
     size_t r1, size_t r2, size_t r3,
@@ -788,13 +914,15 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp_mop(
     // 解包 block modes
     const size_t blocks_per_frame = (size_t)blocks_i * (size_t)blocks_j;
     const size_t n_modes = (size_t)Tt * blocks_per_frame;
-    if (pm_len < ( (n_modes + 3) / 4 )){
+    // if (pm_len < ( (n_modes + 3) / 4 )){ //2bit
+    if (pm_len < ( (n_modes + 7) / 8 )){ //1bit
         fprintf(stderr, "[DEC] ERROR: pm_len too small (pm_len=%llu, expect >= %zu)\n",
                 (unsigned long long)pm_len, (n_modes+3)/4);
         return false;
     }
     std::vector<uint8_t> modes;
-    unpack_modes_2bit(pm_bytes, n_modes, modes);
+    // unpack_modes_2bit(pm_bytes, n_modes, modes);
+    unpack_modes_1bit(pm_bytes, n_modes, modes);
     // Optional: Debug
     printf("read MOP2: BH=%u BW=%u blocks_i=%u blocks_j=%u n_modes=%zu\n",
            BH,BW,blocks_i,blocks_j,n_modes);
@@ -807,14 +935,14 @@ bool sz_decompress_cp_preserve_sos_2p5d_fp_mop(
     const T_data* unpred_pos  = unpred_data;
     p += unpred_cnt * sizeof(T_data);
     //print sum of unpred_data
-    {
-        double sumU=0.0, sumV=0.0;
-        for (size_t idx=0; idx<unpred_cnt/2; ++idx){
-            sumU += (double)(unpred_data[2*idx+0]);
-            sumV += (double)(unpred_data[2*idx+1]);
-        }
-        printf("sum of unpred U = %.6f, V = %.6f, sumU+V = %.6f\n", sumU, sumV, sumU+sumV);
-    }
+    // {
+    //     double sumU=0.0, sumV=0.0;
+    //     for (size_t idx=0; idx<unpred_cnt/2; ++idx){
+    //         sumU += (double)(unpred_data[2*idx+0]);
+    //         sumV += (double)(unpred_data[2*idx+1]);
+    //     }
+    //     printf("sum of unpred U = %.6f, V = %.6f, sumU+V = %.6f\n", sumU, sumV, sumU+sumV);
+    // }
 
     size_t eb_num=0; read_variable_from_src(p, eb_num);
     int* eb_idx = Huffman_decode_tree_and_data(/*state_num=*/2*1024, eb_num, p);

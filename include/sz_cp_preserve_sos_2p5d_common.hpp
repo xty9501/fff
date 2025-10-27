@@ -32,11 +32,13 @@
 #include <array>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
 #include <functional>
 #include <utility>
 #include <initializer_list>
 #include <tuple>
+#include <queue>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -54,6 +56,7 @@
 #include <ftk/numeric/inverse_linear_interpolation_solver.hh>
 #include <ftk/numeric/clamp.hh>
 #include <ftk/numeric/linear_interpolation.hh>
+#include <ftk/geometry/cc2curves.hh>
 
 #include "sz_cp_preserve_utils.hpp"
 
@@ -583,6 +586,7 @@ inline std::array<Tet,3> prism_split_3tets(const std::array<size_t,3>& a,
                                            const std::array<size_t,3>& b){
     // T0={a0,a1,a2,b2}, T1={a0,a1,b1,b2}, T2={a0,b0,b1,b2}
     return {{
+        // FTK 版本的切分
         Tet{ a[0], a[1], a[2], b[2] },
         Tet{ a[0], a[1], b[1], b[2] },
         Tet{ a[0], b[0], b[1], b[2] }
@@ -757,6 +761,7 @@ static void summarize_cp_faces_per_layer_and_slab(
   for (int t = 0; t < T - 1; ++t) {
     const size_t dv = (size_t)H * (size_t)W;
 
+    //横向面 x-axis
     for (int i = 0; i < H; ++i) {
       for (int j = 0; j < W - 1; ++j) {
         size_t a  = vid(t, i, j, sz);
@@ -767,6 +772,7 @@ static void summarize_cp_faces_per_layer_and_slab(
       }
     }
 
+    //纵向面 y-axis
     for (int i = 0; i < H - 1; ++i) {
       for (int j = 0; j < W; ++j) {
         size_t a  = vid(t, i,     j, sz);
@@ -776,14 +782,14 @@ static void summarize_cp_faces_per_layer_and_slab(
         classify_slab(t, FaceKeySZ(a, bp, ap));
       }
     }
-
+    //对角线面
     for (int i = 0; i < H - 1; ++i) {
       for (int j = 0; j < W - 1; ++j) {
         size_t ax0y0 = vid(t, i,     j,     sz);
         size_t ax1y1 = vid(t, i + 1, j + 1, sz);
         size_t bx0y0 = ax0y0 + dv, bx1y1 = ax1y1 + dv;
-        classify_slab(t, FaceKeySZ(ax0y0, ax1y1, bx0y0));
-        classify_slab(t, FaceKeySZ(ax1y1, bx0y0, bx1y1));
+        classify_slab(t, FaceKeySZ(ax0y0, ax1y1, bx1y1));
+        classify_slab(t, FaceKeySZ(ax0y0, bx0y0, bx1y1));
       }
     }
 
@@ -792,21 +798,51 @@ static void summarize_cp_faces_per_layer_and_slab(
         size_t ax0y0 = vid(t, i,     j,     sz);
         size_t ax0y1 = vid(t, i + 1, j,     sz);
         size_t ax1y1 = vid(t, i + 1, j + 1, sz);
+        size_t ax1y0 = vid(t, i,     j + 1, sz);
         size_t bx0y0 = ax0y0 + dv;
         size_t bx0y1 = ax0y1 + dv;
         size_t bx1y1 = ax1y1 + dv;
-
-        classify_slab(t, FaceKeySZ(ax0y1, bx0y0, ax1y1));
-        classify_slab(t, FaceKeySZ(ax0y1, bx0y0, bx1y1));
-
-        size_t ax1y0 = vid(t, i,     j + 1, sz);
         size_t bx1y0 = ax1y0 + dv;
-
-        classify_slab(t, FaceKeySZ(ax0y0, ax1y1, bx1y0));
-        classify_slab(t, FaceKeySZ(ax1y1, bx0y0, bx1y0));
+        //upper triangle
+        classify_slab(t, FaceKeySZ(ax0y0,bx1y1,ax0y1));
+        classify_slab(t, FaceKeySZ(ax0y0,bx1y1,bx0y1));
+        //lower triangle
+        classify_slab(t, FaceKeySZ(ax0y0,bx1y0,bx1y1));
+        classify_slab(t, FaceKeySZ(ax0y0,ax1y0,bx1y1));
       }
     }
   }
+  //total for slabs
+  if (!slab_counts.empty()) {
+    ConfusionCounts total_slab;
+    for (const auto& c : slab_counts) {
+      total_slab.tp += c.tp;
+      total_slab.tn += c.tn;
+      total_slab.fp += c.fp;
+      total_slab.fn += c.fn;
+    }
+    std::cout << "[VERIFY] total slab CP confusion (between layers): "
+              << "TP=" << total_slab.tp
+              << ", TN=" << total_slab.tn
+              << ", FP=" << total_slab.fp
+              << ", FN=" << total_slab.fn << "\n";
+  }
+  //total for layers
+  {
+    ConfusionCounts total_layer;
+    for (const auto& c : layer_counts) {
+      total_layer.tp += c.tp;
+      total_layer.tn += c.tn;
+      total_layer.fp += c.fp;
+      total_layer.fn += c.fn;
+    }
+    std::cout << "[VERIFY] total layer CP confusion (surface faces): "
+              << "TP=" << total_layer.tp
+              << ", TN=" << total_layer.tn
+              << ", FP=" << total_layer.fp
+              << ", FN=" << total_layer.fn << "\n";
+  }
+
 
   #if VERBOSE
   std::cout << "[VERIFY] per-layer CP confusion (surface faces):\n";
@@ -878,14 +914,23 @@ compute_cp_2p5d_faces_parallel(const T_fp* U_fp, const T_fp* V_fp,
 {
   std::unordered_set<FaceKeySZ, FaceKeySZHash> faces_with_cp;
   faces_with_cp.reserve((size_t)(H*(size_t)W*(size_t)T / 8));
-    // 使用 OpenMP 并行：每个线程使用本地缓冲，最后统一去重合并
-    printf("Using OpenMP with %d threads\n", omp_get_max_threads());
-    const int nthreads = omp_get_max_threads();
-    std::vector<std::vector<FaceKeySZ>> thread_faces(nthreads);
+  // 使用 OpenMP 并行：每个线程使用本地缓冲，最后统一去重合并
+#ifdef _OPENMP
+  const int nthreads = omp_get_max_threads();
+  printf("Using OpenMP with %d threads\n", nthreads);
+#else
+  const int nthreads = 1;
+#endif
+  std::vector<std::vector<FaceKeySZ>> thread_faces((size_t)nthreads);
     #pragma omp parallel
     {
-      const int tid = omp_get_thread_num();
-      auto &local = thread_faces[tid];
+      const int tid =
+#ifdef _OPENMP
+        omp_get_thread_num();
+#else
+        0;
+#endif
+      auto &local = thread_faces[(size_t)tid];
 
       // ---------------- (1) 层内面：每一层 t ∈ [0..T-1] ----------------
       #pragma omp for collapse(3) schedule(static)
@@ -1028,6 +1073,175 @@ compute_cp_2p5d_faces_parallel(const T_fp* U_fp, const T_fp* V_fp,
   return faces_with_cp;
 }
 
+
+template<typename T_fp>
+static std::unordered_set<FaceKeySZ, FaceKeySZHash>
+compute_cp_2p5d_faces_parallel_new(const T_fp* U_fp, const T_fp* V_fp,
+                               int H, int W, int T,
+                               const Size3& sz,
+                               size_t dv,
+                               std::vector<int>& cp_per_layer)
+{
+  std::unordered_set<FaceKeySZ, FaceKeySZHash> faces_with_cp;
+  faces_with_cp.reserve((size_t)(H*(size_t)W*(size_t)T / 8));
+  // 使用 OpenMP 并行：每个线程使用本地缓冲，最后统一去重合并
+#ifdef _OPENMP
+  const int nthreads = omp_get_max_threads();
+  printf("Using OpenMP with %d threads\n", nthreads);
+#else
+  const int nthreads = 1;
+#endif
+  std::vector<std::vector<FaceKeySZ>> thread_faces((size_t)nthreads);
+    #pragma omp parallel
+    {
+      const int tid =
+#ifdef _OPENMP
+        omp_get_thread_num();
+#else
+        0;
+#endif
+      auto &local = thread_faces[(size_t)tid];
+
+      // ---------------- (1) 层内面：每一层 t ∈ [0..T-1] ----------------
+      #pragma omp for collapse(3) schedule(static)
+      for (int t=0; t<T; ++t){
+        for (int i=0; i<H-1; ++i){
+          for (int j=0; j<W-1; ++j){
+            if (i==0 && j==0 && (t % 1000 == 0)){
+              printf("pre-compute cp lower layer %d / %d\n", t, T);
+            }
+            size_t v00 = vid(t,i,  j,  sz); 
+            size_t v10 = vid(t,i,  j+1,sz); // v10=> x=1,y=0
+            size_t v01 = vid(t,i+1,j,  sz);
+            size_t v11 = vid(t,i+1,j+1,sz);
+
+            if (face_has_cp_robust(v00,v01,v11, U_fp,V_fp)){
+              local.emplace_back(v00,v01,v11);
+              #pragma omp atomic update
+              cp_per_layer[t]++;
+            }
+            if (face_has_cp_robust(v00,v10,v11, U_fp,V_fp)){
+              local.emplace_back(v00,v10,v11);
+              #pragma omp atomic update
+              cp_per_layer[t]++;
+            }
+          }
+        }
+      }
+
+      // ---------------- (2) 侧面：片 [t, t+1]，t ∈ [0..T-2] ----------------
+      // 2.1 横边：i∈[0..H-1], j∈[0..W-2]
+      #pragma omp for collapse(3) schedule(static)
+      for (int t=0; t<T-1; ++t){
+        for (int i=0; i<H; ++i){
+          for (int j=0; j<W-1; ++j){
+            if (i==0 && j==0 && (t % 1000 == 0)){
+              printf("pre-compute cp side_hor layer %d / %d\n", t, T);
+            }
+            size_t a  = vid(t, i, j,   sz);
+            size_t b  = vid(t, i, j+1, sz);
+            size_t ap = a + dv, bp = b + dv;
+            if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  local.emplace_back(a,b,bp);
+            if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) local.emplace_back(a,bp,ap);
+          }
+        }
+      }
+
+      // 2.2 竖边：i∈[0..H-2], j∈[0..W-1]
+      #pragma omp for collapse(3) schedule(static)
+      for (int t=0; t<T-1; ++t){
+        for (int i=0; i<H-1; ++i){
+          for (int j=0; j<W; ++j){
+            if (i==0 && j==0 && (t % 1000 == 0)){
+              printf("pre-compute cp side_ver layer %d / %d\n", t, T);
+            }
+            // size_t a  = vid(t, i,   j, sz);
+            // size_t b  = vid(t, i+1, j, sz);
+            // size_t ap = a + dv, bp = b + dv;
+            // if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  local.emplace_back(a,b,bp);
+            // if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) local.emplace_back(a,bp,ap);
+            size_t ax0y0 = vid(t,i,  j,  sz);
+            size_t ax0y1 = vid(t,i+1,j,  sz);
+            size_t bx0y0 = ax0y0 + dv, bx0y1 = ax0y1 + dv;
+            if (face_has_cp_robust(ax0y0, ax0y1,bx0y1, U_fp,V_fp))  local.emplace_back(ax0y0, ax0y1,bx0y1); //ftk version
+            if (face_has_cp_robust(ax0y0,bx0y0,bx0y1, U_fp,V_fp)) local.emplace_back(ax0y0,bx0y0,bx0y1); //ftk version
+          }
+        }
+      }
+
+      // 2.3 对角边：i∈[0..H-2], j∈[0..W-2]
+      #pragma omp for collapse(3) schedule(static)
+      for (int t=0; t<T-1; ++t){
+        for (int i=0; i<H-1; ++i){
+          for (int j=0; j<W-1; ++j){
+            if (i==0 && j==0 && (t % 1000 == 0)){
+              printf("pre-compute cp diag layer %d / %d\n", t, T);
+            }
+            // size_t a  = vid(t, i,   j,   sz);
+            // size_t b  = vid(t, i+1, j+1, sz);
+            // size_t ap = a + dv, bp = b + dv;
+            // if (face_has_cp_robust(a,b,bp, U_fp,V_fp))  local.emplace_back(a,b,bp);
+            // if (face_has_cp_robust(a,bp,ap, U_fp,V_fp)) local.emplace_back(a,bp,ap);
+            size_t ax0y0 = vid(t,i,  j,  sz);
+            size_t ax1y1 = vid(t,i+1,j+1,sz);
+            size_t bx0y0 = ax0y0 + dv, bx1y1 = ax1y1 + dv;
+            if (face_has_cp_robust(ax0y0,bx0y0,bx1y1, U_fp,V_fp))  local.emplace_back(ax0y0,bx0y0,bx1y1); //ftk version
+            if (face_has_cp_robust(ax0y0,ax1y1,bx1y1, U_fp,V_fp)) local.emplace_back(ax0y0,ax1y1,bx1y1); //ftk version
+          }
+        }
+      }
+
+      // ---------------- (3) 内部剖分面：按 3-tet 切分 ----------------
+      #pragma omp for collapse(3) schedule(static)
+      for (int t=0; t<T-1; ++t){
+        for (int i=0; i<H-1; ++i){
+          for (int j=0; j<W-1; ++j){
+            if (i==0 && j==0 && (t % 1000 == 0)){
+              printf("pre-compute cp inside layer %d / %d\n", t, T);
+            }
+            // Upper prism
+            {
+              // size_t a0 = vid(t,i,  j,  sz);
+              // size_t a1 = vid(t,i,  j+1,sz);
+              // size_t a2 = vid(t,i+1,j+1,sz);
+              // size_t b0 = a0 + dv, b1 = a1 + dv, b2 = a2 + dv;
+              // if (face_has_cp_robust(a0,a1,b2, U_fp,V_fp)) local.emplace_back(a0,a1,b2);
+              // if (face_has_cp_robust(a0,b1,b2, U_fp,V_fp)) local.emplace_back(a0,b1,b2);
+              size_t ax0y0 = vid(t,i,  j,  sz);
+              size_t ax0y1 = vid(t,i+1,  j,sz);
+              size_t ax1y1 = vid(t,i+1,j+1,sz);
+              size_t bx0y0 = ax0y0 + dv, bx0y1 = ax0y1 + dv, bx1y1 = ax1y1 + dv;
+              if (face_has_cp_robust(ax0y0,bx1y1,bx0y1, U_fp,V_fp)) local.emplace_back(ax0y0,bx1y1,bx0y1); //ftk version
+              if (face_has_cp_robust(ax0y0,bx1y1,ax0y1, U_fp,V_fp)) local.emplace_back(ax0y0,bx1y1,ax0y1); //ftkl version
+            }
+            // Lower prism
+            {
+              // size_t a0 = vid(t,i,  j,  sz);
+              // size_t a1 = vid(t,i+1,j,  sz);
+              // size_t a2 = vid(t,i+1,j+1,sz);
+              // size_t b0 = a0 + dv, b1 = a1 + dv, b2 = a2 + dv;
+              // if (face_has_cp_robust(a0,a1,b2, U_fp,V_fp)) local.emplace_back(a0,a1,b2);
+              // if (face_has_cp_robust(a0,b1,b2, U_fp,V_fp)) local.emplace_back(a0,b1,b2);
+              size_t ax0y0 = vid(t,i,  j,  sz);
+              size_t ax1y0 = vid(t,i,j+1,  sz);
+              size_t ax1y1 = vid(t,i+1,j+1,sz);
+              size_t bx0y0 = ax0y0 + dv, bx1y0 = ax1y0 + dv, bx1y1 = ax1y1 + dv;
+              if (face_has_cp_robust(ax0y0,bx1y0,bx1y1, U_fp,V_fp)) local.emplace_back(ax0y0,bx1y0,bx1y1);//ftk version
+              if (face_has_cp_robust(ax0y0,ax1y0,bx1y1, U_fp,V_fp)) local.emplace_back(ax0y0,ax1y0,bx1y1);//ftk version
+            }
+          }
+        }
+      }
+    } // end parallel
+
+    // 合并去重
+    for (auto &vec : thread_faces){
+      for (const auto &fk : vec){
+        faces_with_cp.emplace(fk);
+      }
+    }
+  return faces_with_cp;
+}
 template<typename T_fp>
 static std::unordered_set<FaceKeySZ, FaceKeySZHash>
 compute_cp_2p5d_faces_serial(const T_fp* U_fp, const T_fp* V_fp,
@@ -1173,6 +1387,210 @@ compute_cp_2p5d_faces(const T_fp* U_fp, const T_fp* V_fp,
   return faces_with_cp;
 }
 
+template<typename T_fp>
+static std::unordered_set<FaceKeySZ, FaceKeySZHash>
+compute_cp_2p5d_faces_new(const T_fp* U_fp, const T_fp* V_fp,
+                      int H, int W, int T, std::string filenam="")
+{
+  bool write_to_file = !filenam.empty();
+  const Size3 sz{H, W, T};
+  const size_t dv = (size_t)H * (size_t)W;
+  std::vector<int> cp_per_layer(T, 0);
+  auto faces_with_cp = compute_cp_2p5d_faces_parallel_new(
+      U_fp, V_fp, H, W, T, sz, dv, cp_per_layer);
+
+  // 打印每层 cp 数量（保持原行为）
+  // for (int t=0; t<T; t+=10){
+  //     printf("  cp in layer %d = %d\n", t, cp_per_layer[t]);
+  // }
+
+  if (write_to_file) {
+    std::ofstream ofs(filenam);
+    if (ofs) {
+      for (int t = 0; t < T; ++t) {
+        ofs << cp_per_layer[t] << "\n";
+      }
+      ofs.close();
+      printf("Wrote cp per layer to %s\n", filenam.c_str());
+    } else {
+      printf("Failed to open file %s for writing cp per layer\n", filenam.c_str());
+    }
+  }
+
+  return faces_with_cp;
+}
+
+// =====================================================================
+// ===============  2.5D 全局 compute_cp （返回哈希集合）FTK划分  ==============
+// =====================================================================
+
+template<typename T_fp>
+static inline void accumulate_face_layer_count(
+    const FaceKeySZ& face,
+    const Size3& sz,
+    std::vector<int>& cp_per_layer)
+{
+  if (cp_per_layer.empty())
+    return;
+
+  int t0, i0, j0;
+  inv_vid(face.v[0], sz.H, sz.W, t0, i0, j0);
+  bool same_layer = true;
+  for (int k = 1; k < 3; ++k) {
+    int tk, ik, jk;
+    inv_vid(face.v[k], sz.H, sz.W, tk, ik, jk);
+    if (tk != t0) {
+      same_layer = false;
+      break;
+    }
+  }
+
+  if (same_layer && t0 >= 0 && t0 < (int)cp_per_layer.size())
+    cp_per_layer[(size_t)t0]++;
+}
+
+inline std::array<FaceKeySZ,4> tetra_face_keys(const Tet& tet)
+{
+  return {{
+      FaceKeySZ(tet.v[0], tet.v[1], tet.v[2]),
+      FaceKeySZ(tet.v[0], tet.v[1], tet.v[3]),
+      FaceKeySZ(tet.v[1], tet.v[2], tet.v[3]),
+      FaceKeySZ(tet.v[2], tet.v[0], tet.v[3])
+  }};
+}
+
+template<typename T_fp>
+static std::unordered_set<FaceKeySZ, FaceKeySZHash>
+ftk_compute_cp_2p5d_faces(const T_fp* U_fp, const T_fp* V_fp,
+                      int H, int W, int T, std::string filenam="")
+{
+  //TODO:之后要把hit_hist的相关统计去掉，算准确时间
+  std::unordered_set<FaceKeySZ, FaceKeySZHash> faces_with_cp;
+  if (H < 2 || W < 2 || T < 1)
+    return faces_with_cp;
+
+  const Size3 sz{H, W, T};
+  const size_t dv = static_cast<size_t>(H) * static_cast<size_t>(W);
+  std::vector<int> cp_per_layer((size_t)T, 0);
+
+  auto record_face = [&](const FaceKeySZ& face) {
+    auto res = faces_with_cp.emplace(face);
+    if (res.second)
+      accumulate_face_layer_count<T_fp>(face, sz, cp_per_layer);
+  };
+
+  std::vector<size_t> hit_hist(5, 0);
+  size_t tetra_total = 0;
+
+  struct BadTetInfo {
+    int t;
+    int i;
+    int j;
+    TriInCell tri_type;
+    int local_index;
+    size_t hits;
+  };
+  std::vector<BadTetInfo> bad_tets;
+
+  auto process_tetra = [&](int t, int i, int j,
+                           TriInCell tri_type,
+                           int local_index,
+                           const Tet& tet) {
+    ++tetra_total;
+    size_t hits = 0;
+    const auto face_keys = tetra_face_keys(tet);
+    for (const auto& face : face_keys) {
+      if (face_has_cp_robust(face.v[0], face.v[1], face.v[2], U_fp, V_fp)) {
+        ++hits;
+        record_face(face);
+      }
+    }
+
+    if (hits >= hit_hist.size())
+      hit_hist.resize(hits + 1, 0);
+    hit_hist[hits]++;
+
+    if (hits != 0 && hits != 2 && bad_tets.size() < 16) {
+      bad_tets.push_back({t, i, j, tri_type, local_index, hits});
+    }
+  };
+
+  if (T == 1) {
+    for (int i = 0; i < H - 1; ++i) {
+      for (int j = 0; j < W - 1; ++j) {
+        const size_t v00 = vid(0, i,     j,     sz);
+        const size_t v01 = vid(0, i,     j + 1, sz);
+        const size_t v10 = vid(0, i + 1, j,     sz);
+        const size_t v11 = vid(0, i + 1, j + 1, sz);
+
+        if (face_has_cp_robust(v00, v01, v11, U_fp, V_fp))
+          record_face(FaceKeySZ(v00, v01, v11));
+        if (face_has_cp_robust(v00, v10, v11, U_fp, V_fp))
+          record_face(FaceKeySZ(v00, v10, v11));
+      }
+    }
+  } else {
+    for (int t = 0; t < T - 1; ++t) {
+      for (int i = 0; i < H - 1; ++i) {
+        for (int j = 0; j < W - 1; ++j) {
+          auto process_prism = [&](TriInCell which) {
+            const auto base = tri_vertices_2d(i, j, which, t, sz);
+            const std::array<size_t,3> top{
+                base[0] + dv,
+                base[1] + dv,
+                base[2] + dv
+            };
+            const auto tets = prism_split_3tets(base, top);
+            for (int local = 0; local < (int)tets.size(); ++local)
+              process_tetra(t, i, j, which, local, tets[local]);
+          };
+
+          process_prism(TriInCell::Upper);
+          process_prism(TriInCell::Lower);
+        }
+      }
+    }
+  }
+
+  if (tetra_total > 0) {
+    std::cout << "[compute_cp_2p5d_faces] tetra face-hit histogram:";
+    for (size_t h = 0; h < hit_hist.size(); ++h)
+      std::cout << ' ' << h << '=' << hit_hist[h];
+    std::cout << std::endl;
+
+    if (!bad_tets.empty()) {
+      std::cout << "[compute_cp_2p5d_faces] warning: "
+                << bad_tets.size()
+                << " tetrahedra have a face-hit count other than 0 or 2 (showing up to 16)."
+                << std::endl;
+      for (size_t idx = 0; idx < bad_tets.size(); ++idx) {
+        const auto& bt = bad_tets[idx];
+        std::cout << "  tet(t=" << bt.t
+                  << ", i=" << bt.i
+                  << ", j=" << bt.j
+                  << ", tri=" << (bt.tri_type == TriInCell::Upper ? "Upper" : "Lower")
+                  << ", local=" << bt.local_index
+                  << ", hits=" << bt.hits << ")" << std::endl;
+      }
+    } else {
+      std::cout << "[compute_cp_2p5d_faces] all tetrahedra satisfy the 0/2 face-hit rule." << std::endl;
+    }
+  }
+
+  if (!filenam.empty()) {
+    std::ofstream ofs(filenam);
+    if (ofs) {
+      for (int t = 0; t < T; ++t)
+        ofs << cp_per_layer[t] << '\n';
+      ofs.close();
+      std::cout << "Wrote cp per layer to " << filenam << std::endl;
+    } else {
+      std::cout << "Failed to open file " << filenam << " for writing cp per layer" << std::endl;
+    }
+  }
+
+  return faces_with_cp;
+}
 
 // -------- 便捷查询（可在逐顶点流程里用）----------
 static inline bool has_cp(const std::unordered_set<FaceKeySZ,FaceKeySZHash>& cp_faces,
@@ -1181,159 +1599,478 @@ static inline bool has_cp(const std::unordered_set<FaceKeySZ,FaceKeySZHash>& cp_
   return cp_faces.find(FaceKeySZ(a,b,c)) != cp_faces.end();
 }
 
+struct TracedCriticalPointSampleSZ {
+  FaceKeySZ face;
+  size_t face_id = 0;
+  std::array<double,3> position{{0.0, 0.0, 0.0}}; // x, y, t
+  std::array<double,3> barycentric{{0.0, 0.0, 0.0}};
+  double cond = 0.0;
+  bool ordinal = false;
+  bool solver_success = false;
+};
 
-// ============ 辅助：对一个三角做一次“CP/eb”并回写到 eb_min ============
-template<typename Tfp>
-inline void consider_triangle_and_update_ebmin(
-    size_t a,size_t b,size_t c,
-    const Tfp* U_fp,const Tfp* V_fp,
-    std::vector<Tfp>& eb_min, size_t &cp_count, std::vector<int> &cp_vector,int time_dim)
+struct TracedCriticalPointCurveSZ {
+  size_t id = 0;
+  bool loop = false;
+  std::vector<TracedCriticalPointSampleSZ> samples;
+};
+
+inline bool face_is_ordinal(const FaceKeySZ& face, const Size3& sz)
 {
-    // CP 检测（定点）
-    int64_t vf[3][2] = {
-        { (int64_t)U_fp[a], (int64_t)V_fp[a] },
-        { (int64_t)U_fp[b], (int64_t)V_fp[b] },
-        { (int64_t)U_fp[c], (int64_t)V_fp[c] }
-    };
-    int idxs[3] = {static_cast<int>(a), static_cast<int>(b), static_cast<int>(c)}; //这里的idx只能用int..ftk的接口就是这样
-
-    if (ftk::robust_critical_point_in_simplex2(vf, idxs)) {
-        eb_min[a]=0; eb_min[b]=0; eb_min[c]=0;
-        cp_count++;
-        cp_vector[time_dim]++;
-        return;
-    }
-    // eb 推导（一次）
-    Tfp eb = derive_cp_abs_eb_sos_online<Tfp>(
-                U_fp[a],U_fp[b],U_fp[c],
-                V_fp[a],V_fp[b],V_fp[c]);
-    if (eb < eb_min[a]) eb_min[a]=eb;
-    if (eb < eb_min[b]) eb_min[b]=eb;
-    if (eb < eb_min[c]) eb_min[c]=eb;
+  int t0, i0, j0;
+  inv_vid(face.v[0], sz.H, sz.W, t0, i0, j0);
+  int t1, i1, j1;
+  inv_vid(face.v[1], sz.H, sz.W, t1, i1, j1);
+  int t2, i2, j2;
+  inv_vid(face.v[2], sz.H, sz.W, t2, i2, j2);
+  return (t0 == t1) && (t1 == t2);
 }
 
-// ================== 全局唯一三角遍历 + 内部面 ==================
-// 思路：对每个 slab [t,t+1]
-//   (1) 底面：cell(i,j) 的 Upper/Lower（只在层 t 发一次）
-//   (2) 侧面：以“边×时间”为基本单元（横/竖/对角 v00-v11），统一拆成两三角——全局唯一
-//   (3) 内部剖分面：按您的 3-tet 切分，每个棱柱发两张内部面（只归属本棱柱）
-//   (4) 顶面：仅在最后一个 slab（t==T-2）把层 t+1 的 Upper/Lower 发一次
-template<typename Tfp>
-inline void accumulate_eb_min_global_unique_with_internal(
-    const Size3& sz, const Tfp* U_fp, const Tfp* V_fp,
-    std::vector<Tfp>& eb_min)
+template<typename T_data>
+inline TracedCriticalPointSampleSZ compute_face_cp_sample(
+    const FaceKeySZ& face,
+    size_t face_id,
+    const T_data* U,
+    const T_data* V,
+    const Size3& sz)
 {
-    const int H=sz.H, W=sz.W, T=sz.T;
-    const int dv = H*W; // = sk
-    size_t cp_count =0;
-    std::vector<int> cp_per_layer(T,0);
-    std::vector<int> cp_per_slab(T-1,0);
+  TracedCriticalPointSampleSZ sample;
+  sample.face = face;
+  sample.face_id = face_id;
+  sample.ordinal = face_is_ordinal(face, sz);
 
-    for (int t=0; t<T-1; ++t){
+  double vecs[3][2];
+  double coords[3][4];
 
-        if (t % 100 == 0){
-            printf("processing slab %d / %d\n", t, T-1);
-        }
-        // -------- (1) 底面：每 cell 两三角（仅层 t） --------
-        for (int i=0; i<H-1; ++i){
-            size_t base_i   = vid(t,i,0,sz);
-            size_t base_ip1 = vid(t,i+1,0,sz);
-            for (int j=0; j<W-1; ++j){
-                size_t v00 = base_i   + j;
-                size_t v01 = base_i   + (j+1);
-                size_t v10 = base_ip1 + j;
-                size_t v11 = base_ip1 + (j+1);
-                // Upper: (v00,v01,v11)
-                consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count,cp_per_layer,t);
-                // Lower: (v00,v10,v11)
-                consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count,cp_per_layer,t);
-            }
-        }
+  for (int k = 0; k < 3; ++k) {
+    const size_t vidx = face.v[(size_t)k];
+    vecs[k][0] = static_cast<double>(U[vidx]);
+    vecs[k][1] = static_cast<double>(V[vidx]);
 
-        // -------- (2) 侧面：边×时间 → 两三角（全局唯一） --------
-        // 2.1 横边 (i,j)-(i,j+1)
-        for (int i=0; i<H; ++i){
-            size_t row = vid(t,i,0,sz);
-            for (int j=0; j<W-1; ++j){
-                size_t a=row+j, b=a+1, ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-            }
-        }
-        // 2.2 竖边 (i,j)-(i+1,j)
-        for (int i=0; i<H-1; ++i){
-            size_t row_i   = vid(t,i,0,sz);
-            size_t row_ip1 = vid(t,i+1,0,sz);
-            for (int j=0; j<W; ++j){
-                size_t a=row_i+j, b=row_ip1+j, ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-            }
-        }
-        // 2.3 对角边 (i,j)-(i+1,j+1)（与三角网格一致，仅此一条对角）
-        for (int i=0; i<H-1; ++i){
-            size_t row_i   = vid(t,i,0,sz);
-            size_t row_ip1 = vid(t,i+1,0,sz);
-            for (int j=0; j<W-1; ++j){
-                size_t a=row_i+j, b=row_ip1+(j+1), ap=a+dv, bp=b+dv;
-                consider_triangle_and_update_ebmin(a,b,bp,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                consider_triangle_and_update_ebmin(a,bp,ap,U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-            }
-        }
+    int t, i, j;
+    inv_vid(vidx, sz.H, sz.W, t, i, j);
+    coords[k][0] = static_cast<double>(j);
+    coords[k][1] = static_cast<double>(i);
+    coords[k][2] = 0.0;
+    coords[k][3] = static_cast<double>(t);
+  }
 
-        // -------- (3) 内部剖分面：每棱柱两面（仅归属本棱柱） --------
-        for (int i=0; i<H-1; ++i){
-            for (int j=0; j<W-1; ++j){
-                // Upper prism
-                {
-                    auto a = tri_vertices_2d(i,j,TriInCell::Upper,t,sz);
-                    std::array<size_t,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
-                    // 两张内部面： (a0,a1,b2), (a0,b1,b2)
-                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                }
-                // Lower prism
-                {
-                    auto a = tri_vertices_2d(i,j,TriInCell::Lower,t,sz);
-                    std::array<size_t,3> b{ a[0]+dv, a[1]+dv, a[2]+dv };
-                    consider_triangle_and_update_ebmin(a[0],a[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                    consider_triangle_and_update_ebmin(a[0],b[1],b[2],U_fp,V_fp,eb_min,cp_count,cp_per_slab,t);
-                }
-            }
-        }
+  double mu[3];
+  double cond = 0.0;
+  bool succ = ftk::inverse_lerp_s2v2(vecs, mu, &cond);
+  if (!succ)
+    ftk::clamp_barycentric<3>(mu);
 
-        // -------- (4) 顶面：仅最后一片把层 t+1 发一次 --------
-        if (t==T-2){
-            int tp=t+1;
-            for (int i=0; i<H-1; ++i){
-                size_t base_i   = vid(tp,i,0,sz);
-                size_t base_ip1 = vid(tp,i+1,0,sz);
-                for (int j=0; j<W-1; ++j){
-                    size_t v00=base_i+j, v01=base_i+(j+1);
-                    size_t v10=base_ip1+j, v11=base_ip1+(j+1);
-                    consider_triangle_and_update_ebmin(v00,v01,v11,U_fp,V_fp,eb_min,cp_count);
-                    consider_triangle_and_update_ebmin(v00,v10,v11,U_fp,V_fp,eb_min,cp_count);
-                }
-            }
-        }
-    }
-    printf("total cp count = %ld\n",cp_count);
-    for (int t=0; t<T; t+=10){
-        printf("  cp in layer %d = %d\n", t, cp_per_layer[t]);
-        printf("  cp in slab  %d = %d\n", t, (t<T-1)?cp_per_slab[t]:0);
-    }
+  double pos[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int k = 0; k < 3; ++k)
+    for (int d = 0; d < 4; ++d)
+      pos[d] += coords[k][d] * mu[k];
+
+  sample.position = {pos[0], pos[1], pos[3]};
+  sample.barycentric = {mu[0], mu[1], mu[2]};
+  sample.cond = cond;
+  sample.solver_success = succ;
+  return sample;
 }
+
+inline void add_tetra_adjacency(
+    const Tet& tet,
+    const std::unordered_map<FaceKeySZ, size_t, FaceKeySZHash>& face_to_id,
+    std::vector<std::set<size_t>>& adjacency)
+{
+  static const int face_idx[4][3] = {
+      {1, 2, 3},
+      {0, 2, 3},
+      {0, 1, 3},
+      {0, 1, 2}
+  };
+
+  std::array<size_t,4> hits{};
+  size_t hit_count = 0;
+
+  for (int f = 0; f < 4; ++f) {
+    const FaceKeySZ key(
+        tet.v[face_idx[f][0]],
+        tet.v[face_idx[f][1]],
+        tet.v[face_idx[f][2]]);
+    auto it = face_to_id.find(key);
+    if (it != face_to_id.end())
+      hits[hit_count++] = it->second;
+  }
+
+  for (size_t i = 0; i < hit_count; ++i) {
+    for (size_t j = i + 1; j < hit_count; ++j) {
+      adjacency[hits[i]].insert(hits[j]);
+      adjacency[hits[j]].insert(hits[i]);
+    }
+  }
+}
+
+template<typename T_data>
+inline std::vector<TracedCriticalPointCurveSZ> ftk_trace_critical_point_curves(
+    const T_data* U,
+    const T_data* V,
+    const Size3& sz,
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces)
+{
+  std::vector<TracedCriticalPointCurveSZ> curves;
+  if (cp_faces.empty())
+    return curves;
+
+  std::unordered_map<FaceKeySZ, size_t, FaceKeySZHash> face_to_id;
+  face_to_id.reserve(cp_faces.size() * 2);
+
+  std::vector<TracedCriticalPointSampleSZ> samples;
+  samples.reserve(cp_faces.size());
+
+  size_t next_id = 0;
+  for (const auto& face : cp_faces) {
+    face_to_id.emplace(face, next_id);
+    samples.emplace_back(compute_face_cp_sample(face, next_id, U, V, sz));
+    ++next_id;
+  }
+
+  std::vector<std::set<size_t>> adjacency(samples.size());
+  const size_t dv = static_cast<size_t>(sz.H) * static_cast<size_t>(sz.W);
+
+  if (sz.T >= 2) {
+    for (int t = 0; t < sz.T - 1; ++t) {
+      for (int i = 0; i < sz.H - 1; ++i) {
+        for (int j = 0; j < sz.W - 1; ++j) {
+          auto base_upper = tri_vertices_2d(i, j, TriInCell::Upper, t, sz);
+          std::array<size_t,3> top_upper{
+              base_upper[0] + dv,
+              base_upper[1] + dv,
+              base_upper[2] + dv
+          };
+          for (const auto& tet : prism_split_3tets(base_upper, top_upper))
+            add_tetra_adjacency(tet, face_to_id, adjacency);
+
+          auto base_lower = tri_vertices_2d(i, j, TriInCell::Lower, t, sz);
+          std::array<size_t,3> top_lower{
+              base_lower[0] + dv,
+              base_lower[1] + dv,
+              base_lower[2] + dv
+          };
+          for (const auto& tet : prism_split_3tets(base_lower, top_lower))
+            add_tetra_adjacency(tet, face_to_id, adjacency);
+        }
+      }
+    }
+  }
+
+  std::function<std::set<size_t>(size_t)> neighbor_func =
+      [&](size_t node) -> std::set<size_t> {
+        if (node >= adjacency.size())
+          return std::set<size_t>();
+        return adjacency[node];
+      };
+
+  std::vector<char> visited(samples.size(), 0);
+  for (size_t start = 0; start < samples.size(); ++start) {
+    if (visited[start])
+      continue;
+
+    std::set<size_t> component;
+    std::queue<size_t> q;
+    q.push(start);
+    visited[start] = 1;
+
+    while (!q.empty()) {
+      size_t node = q.front();
+      q.pop();
+      component.insert(node);
+
+      for (size_t nb : adjacency[node]) {
+        if (!visited[nb]) {
+          visited[nb] = 1;
+          q.push(nb);
+        }
+      }
+    }
+
+    auto linear_graphs =
+        ftk::connected_component_to_linear_components<size_t>(component, neighbor_func);
+    for (auto& graph : linear_graphs) {
+      if (graph.empty())
+        continue;
+
+      TracedCriticalPointCurveSZ curve;
+      curve.id = curves.size();
+      curve.loop = ftk::is_loop<size_t>(graph, neighbor_func);
+      curve.samples.reserve(graph.size());
+
+      for (size_t node_id : graph)
+        curve.samples.push_back(samples[node_id]);
+
+      curves.push_back(std::move(curve));
+    }
+  }
+
+  return curves;
+}
+
+template<typename T_data>
+inline std::vector<TracedCriticalPointCurveSZ> ftk_trace_critical_point_curves(
+    const T_data* U,
+    const T_data* V,
+    int H, int W, int T,
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces)
+{
+  const Size3 sz{H, W, T};
+  return ftk_trace_critical_point_curves(U, V, sz, cp_faces);
+}
+
+
+// ----------------------------------------------------------------------------
+// FTK use different way to split tetrahedra: Write traced critical points to VTK PolyData (.vtp) without linking VTK.
+// Produces a PolyData with Points=(x,y,z=t). Each curve is a PolyLine cell.
+// Adds useful PointData and CellData arrays for analysis.
+// ----------------------------------------------------------------------------
+template<typename T_data>
+inline bool ftk_write_traced_critical_point_vtp(
+    const std::string& vtp_path,
+    const T_data* U,
+    const T_data* V,
+    const Size3& sz,
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces)
+{
+  auto curves = ftk_trace_critical_point_curves(U, V, sz, cp_faces);
+
+  // Gather points and attributes
+  std::vector<double> pts; pts.reserve(3 * 1024);
+  std::vector<int>    pt_curve_id;
+  std::vector<int>    pt_seq_idx;
+  std::vector<long long> pt_face_id;
+  std::vector<double> pt_bary; // 3 components
+  std::vector<double> pt_cond;
+  std::vector<int>    pt_ordinal;
+  std::vector<int>    pt_solver_succ;
+
+  std::vector<int> line_conn;   line_conn.reserve(1024);
+  std::vector<int> line_offsets; line_offsets.reserve(256);
+  std::vector<int> line_curve_id;
+  std::vector<int> line_is_loop;
+
+  std::vector<int> vert_conn;   // singleton points (curves with 1 sample)
+  std::vector<int> vert_offsets;
+
+  int point_counter = 0;
+  for (const auto& curve : curves) {
+    const int cid = static_cast<int>(curve.id);
+    const int n   = static_cast<int>(curve.samples.size());
+
+    if (n <= 0) continue;
+
+    // Record points and per-point attributes
+    const int start_idx = point_counter;
+    for (int k = 0; k < n; ++k) {
+      const auto& s = curve.samples[(size_t)k];
+      pts.push_back(s.position[0]);
+      pts.push_back(s.position[1]);
+      pts.push_back(s.position[2]); // use time as z
+
+      pt_curve_id.push_back(cid);
+      pt_seq_idx.push_back(k);
+      pt_face_id.push_back((long long)s.face_id);
+      pt_bary.push_back(s.barycentric[0]);
+      pt_bary.push_back(s.barycentric[1]);
+      pt_bary.push_back(s.barycentric[2]);
+      pt_cond.push_back(s.cond);
+      pt_ordinal.push_back(s.ordinal ? 1 : 0);
+      pt_solver_succ.push_back(s.solver_success ? 1 : 0);
+
+      ++point_counter;
+    }
+
+    // Make a PolyLine (if >=2 points) or a Vert (if single point)
+    if (n >= 2) {
+      for (int k = 0; k < n; ++k)
+        line_conn.push_back(start_idx + k);
+      line_offsets.push_back((line_offsets.empty() ? 0 : line_offsets.back()) + n);
+      line_curve_id.push_back(cid);
+      line_is_loop.push_back(curve.loop ? 1 : 0);
+    } else {
+      vert_conn.push_back(start_idx);
+      vert_offsets.push_back((vert_offsets.empty() ? 0 : vert_offsets.back()) + 1);
+    }
+  }
+
+  // Write XML .vtp (ASCII)
+  std::ofstream ofs(vtp_path);
+  if (!ofs) {
+    std::cerr << "Failed to open " << vtp_path << " for writing .vtp" << std::endl;
+    return false;
+  }
+
+  ofs.setf(std::ios::fixed);
+  ofs << std::setprecision(17);
+
+  const int nPoints = static_cast<int>(pts.size() / 3);
+  const int nLines  = static_cast<int>(line_offsets.size());
+  const int nVerts  = static_cast<int>(vert_offsets.size());
+  const int nCells  = nVerts + nLines; // CellData arrays must cover all cell types
+
+  ofs << "<?xml version=\"1.0\"?>\n";
+  ofs << "<VTKFile type=\"PolyData\" version=\"1.0\" byte_order=\"LittleEndian\">\n";
+  ofs << "  <PolyData>\n";
+  ofs << "    <Piece NumberOfPoints=\"" << nPoints
+      << "\" NumberOfVerts=\"" << nVerts
+      << "\" NumberOfLines=\"" << nLines
+      << "\" NumberOfStrips=\"0\" NumberOfPolys=\"0\">\n";
+
+  // PointData
+  ofs << "      <PointData>\n";
+  // curve_id
+  ofs << "        <DataArray Name=\"curve_id\" type=\"Int32\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_curve_id.size(); ++i) {
+    ofs << pt_curve_id[i] << (i+1==pt_curve_id.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // seq_idx
+  ofs << "        <DataArray Name=\"seq_idx\" type=\"Int32\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_seq_idx.size(); ++i) {
+    ofs << pt_seq_idx[i] << (i+1==pt_seq_idx.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // face_id
+  ofs << "        <DataArray Name=\"face_id\" type=\"Int64\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_face_id.size(); ++i) {
+    ofs << pt_face_id[i] << (i+1==pt_face_id.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // barycentric (3 components)
+  ofs << "        <DataArray Name=\"barycentric\" type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_bary.size(); ++i) {
+    ofs << pt_bary[i] << (i+1==pt_bary.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // cond
+  ofs << "        <DataArray Name=\"cond\" type=\"Float64\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_cond.size(); ++i) {
+    ofs << pt_cond[i] << (i+1==pt_cond.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // ordinal
+  ofs << "        <DataArray Name=\"ordinal\" type=\"Int32\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_ordinal.size(); ++i) {
+    ofs << pt_ordinal[i] << (i+1==pt_ordinal.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  // solver_success
+  ofs << "        <DataArray Name=\"solver_success\" type=\"Int32\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pt_solver_succ.size(); ++i) {
+    ofs << pt_solver_succ[i] << (i+1==pt_solver_succ.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  ofs << "      </PointData>\n";
+
+  // CellData for all cells (Verts + Lines): pad verts with defaults
+  ofs << "      <CellData>\n";
+  if (nCells > 0) {
+    std::vector<int> cell_curve_id;
+    std::vector<int> cell_is_loop;
+    cell_curve_id.reserve(nCells);
+    cell_is_loop.reserve(nCells);
+    // First Verts
+    for (int i = 0; i < nVerts; ++i) {
+      cell_curve_id.push_back(-1);
+      cell_is_loop.push_back(0);
+    }
+    // Then Lines
+    for (size_t i = 0; i < line_curve_id.size(); ++i) {
+      cell_curve_id.push_back(line_curve_id[i]);
+    }
+    for (size_t i = 0; i < line_is_loop.size(); ++i) {
+      cell_is_loop.push_back(line_is_loop[i]);
+    }
+
+    ofs << "        <DataArray Name=\"curve_id\" type=\"Int32\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < cell_curve_id.size(); ++i) {
+      ofs << cell_curve_id[i] << (i+1==cell_curve_id.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+
+    ofs << "        <DataArray Name=\"is_loop\" type=\"Int32\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < cell_is_loop.size(); ++i) {
+      ofs << cell_is_loop[i] << (i+1==cell_is_loop.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+  }
+  ofs << "      </CellData>\n";
+
+  // Points
+  ofs << "      <Points>\n";
+  ofs << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n          ";
+  for (size_t i = 0; i < pts.size(); ++i) {
+    ofs << pts[i] << (i+1==pts.size()?"\n":" ");
+  }
+  ofs << "        </DataArray>\n";
+  ofs << "      </Points>\n";
+
+  // Verts (for curves with a single point)
+  if (nVerts > 0) {
+    ofs << "      <Verts>\n";
+    ofs << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < vert_conn.size(); ++i) {
+      ofs << vert_conn[i] << (i+1==vert_conn.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+    ofs << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < vert_offsets.size(); ++i) {
+      ofs << vert_offsets[i] << (i+1==vert_offsets.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+    ofs << "      </Verts>\n";
+  }
+
+  // Lines
+  if (nLines > 0) {
+    ofs << "      <Lines>\n";
+    ofs << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < line_conn.size(); ++i) {
+      ofs << line_conn[i] << (i+1==line_conn.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+    ofs << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n          ";
+    for (size_t i = 0; i < line_offsets.size(); ++i) {
+      ofs << line_offsets[i] << (i+1==line_offsets.size()?"\n":" ");
+    }
+    ofs << "        </DataArray>\n";
+    ofs << "      </Lines>\n";
+  }
+
+  ofs << "    </Piece>\n";
+  ofs << "  </PolyData>\n";
+  ofs << "</VTKFile>\n";
+
+  ofs.close();
+  return true;
+}
+
+template<typename T_data>
+inline bool ftk_write_traced_critical_point_vtp(
+    const std::string& vtp_path,
+    const T_data* U,
+    const T_data* V,
+    int H, int W, int T,
+    const std::unordered_set<FaceKeySZ, FaceKeySZHash>& cp_faces)
+{
+  const Size3 sz{H, W, T};
+  return ftk_write_traced_critical_point_vtp(vtp_path, U, V, sz, cp_faces);
+}
+
 
 struct Metrics {
-    double min_orig = +std::numeric_limits<double>::infinity();
-    double max_orig = -std::numeric_limits<double>::infinity();
-    double min_recon= +std::numeric_limits<double>::infinity();
-    double max_recon= -std::numeric_limits<double>::infinity();
+    double min_orig  = +std::numeric_limits<double>::infinity();
+    double max_orig  = -std::numeric_limits<double>::infinity();
+    double min_recon = +std::numeric_limits<double>::infinity();
+    double max_recon = -std::numeric_limits<double>::infinity();
     double max_abs_err = 0.0;
-    double max_rel_err = 0.0;
-    double rmse = 0.0;
+    double mse   = 0.0;
+    double rmse  = 0.0;
     double nrmse = 0.0;
-    double psnr = 0.0;
+    double psnr  = 0.0;
 };
 
 template<typename T>
@@ -1342,7 +2079,7 @@ static inline Metrics compute_metrics(const T* orig, const T* recon, size_t N)
     Metrics m;
     long double sse = 0.0L; // 用长双精度累加，降低数值误差
 
-    for (size_t i=0;i<N;++i){
+    for (size_t i = 0; i < N; ++i) {
         const double o = static_cast<double>(orig[i]);
         const double r = static_cast<double>(recon[i]);
         const double e = std::abs(o - r);
@@ -1353,95 +2090,94 @@ static inline Metrics compute_metrics(const T* orig, const T* recon, size_t N)
         m.max_recon = std::max(m.max_recon, r);
 
         m.max_abs_err = std::max(m.max_abs_err, e);
-        if (std::abs(o) > 1e-5){
-            m.max_rel_err = std::max(m.max_rel_err, e / std::abs(o));
-        }
-        const double de = (o - r);
+
+        const double de = o - r;
         sse += static_cast<long double>(de) * static_cast<long double>(de);
     }
 
-    const double rmse = std::sqrt(static_cast<double>(sse / (N>0?N:1)));
+    const double denom = static_cast<double>(N > 0 ? N : 1);
+    const double mse  = static_cast<double>(sse / denom);
+    const double rmse = std::sqrt(mse);
+    m.mse  = mse;
     m.rmse = rmse;
 
     const double range = m.max_orig - m.min_orig; // 原始数据动态范围
     m.nrmse = (range > 0.0) ? rmse / range : rmse;
 
-    if (rmse == 0.0){
+    if (rmse == 0.0) {
         m.psnr = std::numeric_limits<double>::infinity();
-    } else if (range > 0.0){
-        m.psnr = 20.0 * std::log10(range / rmse);
+    } else if (range > 0.0) {
+        m.psnr = 20.0 * std::log10(range) - 10.0 * std::log10(mse);
     } else {
-        // 原始数据为常数场：以 |max_orig| 作为峰值尝试给出 PSNR，否则报告 -inf
         const double peak = std::abs(m.max_orig);
-        m.psnr = (peak > 0.0) ? 20.0 * std::log10(peak / rmse)
-                              : -std::numeric_limits<double>::infinity();
+        m.psnr = (peak > 0.0)
+                 ? 20.0 * std::log10(peak) - 10.0 * std::log10(mse)
+                 : -std::numeric_limits<double>::infinity();
     }
+
     return m;
 }
 
 static inline void print_metrics(const char* name, const Metrics& m)
 {
-    std::cout.setf(std::ios::fixed); std::cout<<std::setprecision(6);
-    std::cout << "["<<name<<"]\n"
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+    std::cout << "[" << name << "]\n"
               << "  orig min/max : " << m.min_orig  << " / " << m.max_orig  << "\n"
               << "  recon min/max: " << m.min_recon << " / " << m.max_recon << "\n"
               << "  max |err|    : " << m.max_abs_err << "\n"
-              << "  max rel err  : " << m.max_rel_err << "\n"
+              << "  MSE          : " << m.mse   << "\n"
               << "  RMSE         : " << m.rmse  << "\n"
               << "  NRMSE        : " << m.nrmse << "  (normalized by orig range)\n"
               << "  PSNR [dB]    : " << m.psnr  << "\n";
 }
 
-// 入口：同时验证 U/V 以及合并后的整体（两分量拼接）
 template<typename T>
 static inline void verify(const T* U_orig, const T* V_orig,
                           const T* U_recon, const T* V_recon,
                           size_t r1, size_t r2, size_t r3)
 {
-    const size_t N = r1*r2*r3;
+    const size_t N = r1 * r2 * r3;
 
     Metrics mu = compute_metrics(U_orig, U_recon, N);
     Metrics mv = compute_metrics(V_orig, V_recon, N);
 
-    // 合并统计（把 U/V 当作 2N 长度的单一序列）
-    // 这里避免额外分配，直接分别累计再合并
     Metrics mall;
     {
-        // 先 U
         mall.min_orig  = std::min(mu.min_orig, mv.min_orig);
         mall.max_orig  = std::max(mu.max_orig, mv.max_orig);
         mall.min_recon = std::min(mu.min_recon, mv.min_recon);
         mall.max_recon = std::max(mu.max_recon, mv.max_recon);
         mall.max_abs_err = std::max(mu.max_abs_err, mv.max_abs_err);
-        mall.max_rel_err = std::max(mu.max_rel_err, mv.max_rel_err);
 
-        // RMSE 合并（基于 SSE 累加）
-        const long double sse_u = static_cast<long double>(mu.rmse) * mu.rmse * N;
-        const long double sse_v = static_cast<long double>(mv.rmse) * mv.rmse * N;
-        const size_t      Nall  = 2*N;
-        const double rmse_all = std::sqrt(static_cast<double>((sse_u + sse_v) / (Nall>0?Nall:1)));
+        // 合并 MSE、RMSE
+        const long double sse_u = static_cast<long double>(mu.mse) * N;
+        const long double sse_v = static_cast<long double>(mv.mse) * N;
+        const size_t Nall = 2 * N;
+        const double mse_all  = static_cast<double>((sse_u + sse_v) / (Nall > 0 ? Nall : 1));
+        const double rmse_all = std::sqrt(mse_all);
+        mall.mse  = mse_all;
         mall.rmse = rmse_all;
 
-        const double range_all = (mall.max_orig - mall.min_orig);
-        mall.nrmse = (range_all>0.0) ? (rmse_all / range_all) : rmse_all;
-        if (rmse_all == 0.0){
+        const double range_all = mall.max_orig - mall.min_orig;
+        mall.nrmse = (range_all > 0.0) ? (rmse_all / range_all) : rmse_all;
+
+        if (rmse_all == 0.0) {
             mall.psnr = std::numeric_limits<double>::infinity();
-        } else if (range_all > 0.0){
-            mall.psnr = 20.0 * std::log10(range_all / rmse_all);
+        } else if (range_all > 0.0) {
+            mall.psnr = 20.0 * std::log10(range_all) - 10.0 * std::log10(mse_all);
         } else {
             const double peak = std::max(std::abs(mall.max_orig), std::abs(mall.min_orig));
-            mall.psnr = (peak>0.0) ? 20.0*std::log10(peak / rmse_all)
-                                   : -std::numeric_limits<double>::infinity();
+            mall.psnr = (peak > 0.0)
+                        ? 20.0 * std::log10(peak) - 10.0 * std::log10(mse_all)
+                        : -std::numeric_limits<double>::infinity();
         }
     }
 
-    // 打印
     print_metrics("U", mu);
     print_metrics("V", mv);
     print_metrics("U+V (combined)", mall);
 }
-
-
 struct Rot2D {
     double c; // cos(theta)
     double s; // sin(theta)
